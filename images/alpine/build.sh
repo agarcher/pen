@@ -10,19 +10,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK_DIR="${SCRIPT_DIR}/.work"
-OUT_DIR="${HOME}/.config/pen/images"
+
+# If RELEASE_DIR is set, produce arch-suffixed artifacts for GitHub Releases.
+# Otherwise, install directly to the local cache.
+if [ -n "${RELEASE_DIR:-}" ]; then
+    OUT_DIR="${RELEASE_DIR}"
+    RELEASE_MODE=1
+else
+    OUT_DIR="${HOME}/.config/pen/images"
+    RELEASE_MODE=0
+fi
 
 # Alpine version and architecture
 ALPINE_VERSION="3.21"
 ALPINE_RELEASE="3.21.3"
 MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
-# Detect host architecture
-case "$(uname -m)" in
-    arm64|aarch64) ARCH="aarch64" ;;
-    x86_64)        ARCH="x86_64" ;;
-    *)             echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
-esac
+# Architecture: override with ARCH env var, or detect from host.
+if [ -z "${ARCH:-}" ]; then
+    case "$(uname -m)" in
+        arm64|aarch64) ARCH="aarch64" ;;
+        x86_64)        ARCH="x86_64" ;;
+        *)             echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+    esac
+fi
 
 MINIROOTFS_URL="${MIRROR}/v${ALPINE_VERSION}/releases/${ARCH}/alpine-minirootfs-${ALPINE_RELEASE}-${ARCH}.tar.gz"
 KERNEL_URL="${MIRROR}/v${ALPINE_VERSION}/releases/${ARCH}/netboot/vmlinuz-virt"
@@ -36,7 +47,11 @@ echo "==> Downloading Alpine minirootfs"
 curl -fSL "${MINIROOTFS_URL}" -o "${WORK_DIR}/minirootfs.tar.gz"
 
 echo "==> Downloading kernel"
-curl -fSL "${KERNEL_URL}" -o "${OUT_DIR}/vmlinuz"
+if [ "$RELEASE_MODE" = "1" ]; then
+    curl -fSL "${KERNEL_URL}" -o "${OUT_DIR}/vmlinuz-${ARCH}"
+else
+    curl -fSL "${KERNEL_URL}" -o "${OUT_DIR}/vmlinuz"
+fi
 
 echo "==> Extracting minirootfs"
 cd "${WORK_DIR}/rootfs"
@@ -112,13 +127,23 @@ echo "nameserver 8.8.8.8" > "${WORK_DIR}/rootfs/etc/resolv.conf"
 
 echo "==> Building initrd (cpio archive)"
 cd "${WORK_DIR}/rootfs"
-find . | cpio -o -H newc 2>/dev/null | gzip > "${OUT_DIR}/initrd"
+if [ "$RELEASE_MODE" = "1" ]; then
+    find . | cpio -o -H newc 2>/dev/null | gzip > "${OUT_DIR}/initrd-${ARCH}"
+else
+    find . | cpio -o -H newc 2>/dev/null | gzip > "${OUT_DIR}/initrd"
+fi
 
 echo "==> Cleaning up"
 rm -rf "${WORK_DIR}"
 
-echo "==> Done!"
-echo "    Kernel: ${OUT_DIR}/vmlinuz"
-echo "    Initrd: ${OUT_DIR}/initrd"
-echo ""
-echo "    Test with: pen shell test --dir ."
+if [ "$RELEASE_MODE" = "1" ]; then
+    echo "==> Done! Release artifacts:"
+    echo "    ${OUT_DIR}/vmlinuz-${ARCH}"
+    echo "    ${OUT_DIR}/initrd-${ARCH}"
+else
+    echo "==> Done!"
+    echo "    Kernel: ${OUT_DIR}/vmlinuz"
+    echo "    Initrd: ${OUT_DIR}/initrd"
+    echo ""
+    echo "    Test with: pen shell test --dir ."
+fi

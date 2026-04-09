@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-binary:
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            arch: amd64
+          - os: macos-latest
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        run: make build-darwin-${{ matrix.arch }}
+
+      - name: Sign binary
+        run: codesign --force --entitlements entitlements/pen.entitlements -s - build/pen-darwin-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pen-darwin-${{ matrix.arch }}
+          path: build/pen-darwin-${{ matrix.arch }}
+
+  build-images:
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image for ${{ matrix.arch }}
+        run: RELEASE_DIR=build ARCH=${{ matrix.arch }} ./images/alpine/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: |
+            build/vmlinuz-${{ matrix.arch }}
+            build/initrd-${{ matrix.arch }}
+
+  publish:
+    needs: [build-binary, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*
+
+  publish-images-latest:
+    needs: [build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update images-latest tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete existing images-latest release if present.
+          gh release delete images-latest --yes 2>/dev/null || true
+          git push origin :refs/tags/images-latest 2>/dev/null || true
+
+          # Create new images-latest release with the image artifacts.
+          gh release create images-latest \
+            --title "VM Images (latest)" \
+            --notes "Auto-updated VM images for pen. Downloaded automatically on first run." \
+            artifacts/*
