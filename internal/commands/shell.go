@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/agarcher/pen/internal/envject"
 	"github.com/agarcher/pen/internal/image"
@@ -47,6 +48,11 @@ Environment variables can be injected into the guest:
 func runShell(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
+	// Check if this VM is already running in another process.
+	if vm.IsRunning(name) {
+		return fmt.Errorf("VM %q is already running (PID %d)", name, vm.ReadPID(name))
+	}
+
 	imgs, err := image.Resolve()
 	if err != nil {
 		return err
@@ -77,6 +83,24 @@ func runShell(cmd *cobra.Command, args []string) error {
 		}
 		defer envject.CleanupEnvFile(dir)
 	}
+
+	// Persist VM state.
+	state := &vm.VMState{
+		Name:      name,
+		Dir:       dir,
+		CPUs:      shellCPUs,
+		MemoryMB:  shellMem,
+		CreatedAt: time.Now(),
+	}
+	if err := vm.Save(state); err != nil {
+		return fmt.Errorf("saving VM state: %w", err)
+	}
+
+	// Write PID so other processes can detect this VM is running.
+	if err := vm.WritePID(name); err != nil {
+		return fmt.Errorf("writing PID file: %w", err)
+	}
+	defer vm.ClearPID(name)
 
 	hyp := virt.NewAppleHypervisor()
 
