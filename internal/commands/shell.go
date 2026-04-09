@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"github.com/agarcher/pen/internal/envject"
 	"github.com/agarcher/pen/internal/image"
 	"github.com/agarcher/pen/internal/virt"
 	"github.com/agarcher/pen/internal/vm"
@@ -12,15 +14,19 @@ import (
 )
 
 var (
-	shellDir  string
-	shellCPUs uint
-	shellMem  uint64
+	shellDir     string
+	shellCPUs    uint
+	shellMem     uint64
+	shellEnv     []string // KEY=VALUE pairs
+	shellEnvHost []string // key names to pass from host env
 )
 
 func init() {
 	shellCmd.Flags().StringVar(&shellDir, "dir", ".", "Directory to share into the VM")
 	shellCmd.Flags().UintVar(&shellCPUs, "cpus", uint(runtime.NumCPU()), "Number of CPUs")
 	shellCmd.Flags().Uint64Var(&shellMem, "memory", 2048, "Memory in MB")
+	shellCmd.Flags().StringArrayVar(&shellEnv, "env", nil, "Set env var in guest (KEY=VALUE)")
+	shellCmd.Flags().StringArrayVar(&shellEnvHost, "env-from-host", nil, "Pass env var from host to guest (KEY)")
 	rootCmd.AddCommand(shellCmd)
 }
 
@@ -29,7 +35,11 @@ var shellCmd = &cobra.Command{
 	Short: "Create (if needed), start, and attach to a VM",
 	Long: `Create a VM if it doesn't exist, start it if stopped, and attach an
 interactive console. The specified directory is shared into the guest
-at /workspace via virtio-fs.`,
+at /workspace via virtio-fs.
+
+Environment variables can be injected into the guest:
+  --env KEY=VALUE         Set an explicit value
+  --env-from-host KEY     Pass a key's value from the host environment`,
 	Args: cobra.ExactArgs(1),
 	RunE: runShell,
 }
@@ -47,10 +57,28 @@ func runShell(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving directory: %w", err)
 	}
 
-	hyp := virt.NewAppleHypervisor()
-	if !hyp.Available() {
-		return fmt.Errorf("Apple Virtualization.framework is not available on this system")
+	// Build env spec from flags.
+	spec := &envject.EnvSpec{
+		FromHost: shellEnvHost,
+		Explicit: make(map[string]string),
 	}
+	for _, e := range shellEnv {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok {
+			return fmt.Errorf("invalid --env value %q (expected KEY=VALUE)", e)
+		}
+		spec.Explicit[k] = v
+	}
+
+	// Write env file to shared dir before boot so guest init can read it.
+	if !spec.IsEmpty() {
+		if err := envject.WriteEnvFile(dir, spec); err != nil {
+			return fmt.Errorf("writing env file: %w", err)
+		}
+		defer envject.CleanupEnvFile(dir)
+	}
+
+	hyp := virt.NewAppleHypervisor()
 
 	fmt.Fprintf(cmd.ErrOrStderr(), "pen: booting %s (cpus=%d mem=%dMB dir=%s)\n", name, shellCPUs, shellMem, dir)
 

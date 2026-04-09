@@ -22,7 +22,7 @@ type VM interface {
 	Stop() error
 	// Wait blocks until the VM stops.
 	Wait() error
-	// Console returns the read/write streams for the VM console.
+	// Console returns the read/write streams for the VM console (hvc0).
 	Console() (io.Reader, io.Writer)
 }
 

@@ -73,10 +73,18 @@ fi
 mkdir -p /workspace
 mount -t virtiofs workspace /workspace 2>/dev/null && echo "workspace mounted at /workspace" || true
 
+# Read injected env vars from the shared directory.
+# The host writes .pen-env before boot; we copy it to tmpfs and delete the original.
+if [ -f /workspace/.pen-env ]; then
+    cp /workspace/.pen-env /run/pen-env
+    rm -f /workspace/.pen-env
+fi
+
 # Set up environment
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TERM=xterm-256color
+[ -f /run/pen-env ] && . /run/pen-env
 cd /workspace 2>/dev/null || cd /root
 
 echo ""
@@ -88,12 +96,13 @@ exec /bin/sh -l
 INITEOF
 chmod +x "${WORK_DIR}/rootfs/init"
 
-# Configure shell profile
+# Configure shell profile — sources injected env vars
 cat > "${WORK_DIR}/rootfs/etc/profile" << 'PROFILEEOF'
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TERM=xterm-256color
 export PS1='pen:\w\$ '
+[ -f /run/pen-env ] && . /run/pen-env
 cd /workspace 2>/dev/null || true
 PROFILEEOF
 

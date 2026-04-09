@@ -10,10 +10,12 @@ all: build
 
 build:
 	CGO_ENABLED=1 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) ./cmd/pen
-	codesign --entitlements entitlements/pen.entitlements -s - $(BUILD_DIR)/$(BINARY)
+	codesign --force --entitlements entitlements/pen.entitlements -s - $(BUILD_DIR)/$(BINARY)
+
+GUEST_GOARCH := $(if $(filter arm64 aarch64,$(shell uname -m)),arm64,amd64)
 
 build-guest-agent:
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o $(BUILD_DIR)/pen-agent ./guest/agent
+	GOOS=linux GOARCH=$(GUEST_GOARCH) CGO_ENABLED=0 go build -o $(BUILD_DIR)/pen-agent ./guest/agent
 
 install: build
 	cp $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)

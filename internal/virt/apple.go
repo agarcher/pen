@@ -38,9 +38,7 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 		return nil, fmt.Errorf("creating VM config: %w", err)
 	}
 
-	// Console: create pipes for bidirectional host ↔ guest I/O.
-	// guestIn/guestOut are given to the VM attachment.
-	// hostIn/hostOut are used by the host to read/write.
+	// Port 0: interactive console (hvc0) — bidirectional pipes.
 	guestIn, hostOut, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("creating guest input pipe: %w", err)
@@ -50,13 +48,13 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 		return nil, fmt.Errorf("creating guest output pipe: %w", err)
 	}
 
-	attachment, err := vz.NewFileHandleSerialPortAttachment(guestIn, guestOut)
+	consoleAttachment, err := vz.NewFileHandleSerialPortAttachment(guestIn, guestOut)
 	if err != nil {
-		return nil, fmt.Errorf("creating serial attachment: %w", err)
+		return nil, fmt.Errorf("creating console attachment: %w", err)
 	}
 
 	consolePort, err := vz.NewVirtioConsolePortConfiguration(
-		vz.WithVirtioConsolePortConfigurationAttachment(attachment),
+		vz.WithVirtioConsolePortConfigurationAttachment(consoleAttachment),
 		vz.WithVirtioConsolePortConfigurationIsConsole(true),
 	)
 	if err != nil {
@@ -132,8 +130,8 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 
 type appleVM struct {
 	machine *vz.VirtualMachine
-	hostIn  *os.File // read from guest
-	hostOut *os.File // write to guest
+	hostIn  *os.File // console: read from guest
+	hostOut *os.File // console: write to guest
 	done    chan struct{}
 	once    sync.Once
 }
