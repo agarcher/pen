@@ -62,29 +62,90 @@ echo "==> Configuring guest init"
 cat > "${WORK_DIR}/rootfs/init" << 'INITEOF'
 #!/bin/sh
 # pen guest init — runs as PID 1 inside the VM
+#
+# Two stages:
+#   stage 1: bare initramfs. Mount essentials, bring up network, set up the
+#            overlayfs over /dev/vda if present, then chroot into the merged
+#            view and re-exec this script as stage 2.
+#   stage 2: same script with PEN_INIT_STAGE2=1. Mount workspace, source env,
+#            launch the interactive shell.
+#
+# When /dev/vda is absent (legacy/back-compat) stage 1 falls through to the
+# stage 2 work in the original initramfs — ephemeral, like the pre-overlay
+# behavior.
 
-# Mount essential filesystems
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
-mkdir -p /dev/pts
-mount -t devpts devpts /dev/pts
+if [ -z "${PEN_INIT_STAGE2:-}" ]; then
+    # ===== STAGE 1 =====
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mount -t devtmpfs devtmpfs /dev
+    mount -t tmpfs tmpfs /tmp
+    mount -t tmpfs tmpfs /run
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts
 
-# Set hostname
-hostname pen
+    hostname pen
+    ip link set lo up
 
-# Bring up loopback
-ip link set lo up
+    if ip link show eth0 >/dev/null 2>&1; then
+        ip link set eth0 up
+        udhcpc -b -i eth0 -q -s /etc/udhcpc/default.script 2>/dev/null &
+    fi
 
-# Try to bring up eth0 with DHCP (background, non-blocking)
-if ip link show eth0 >/dev/null 2>&1; then
-    ip link set eth0 up
-    udhcpc -b -i eth0 -q -s /etc/udhcpc/default.script 2>/dev/null &
+    if [ -b /dev/vda ]; then
+        # Format the overlay disk on first boot. e2fsprogs is not in the
+        # base minirootfs, so install it lazily — only the very first boot
+        # of a fresh VM pays this cost. Subsequent boots see an already-
+        # formatted disk and skip both the install and the mkfs.
+        if ! blkid /dev/vda >/dev/null 2>&1; then
+            if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+                # Wait briefly for DHCP so apk can reach the repos.
+                i=0
+                while [ $i -lt 5 ]; do
+                    ip route get 8.8.8.8 >/dev/null 2>&1 && break
+                    sleep 1
+                    i=$((i+1))
+                done
+                echo "pen: installing e2fsprogs (one-time, fresh disk)..."
+                apk update >/dev/null 2>&1 || true
+                if ! apk add e2fsprogs >/dev/null 2>&1; then
+                    echo "pen: failed to install e2fsprogs; running ephemeral" >&2
+                    PEN_INIT_STAGE2=1
+                    export PEN_INIT_STAGE2
+                    exec /init
+                fi
+            fi
+            echo "pen: formatting overlay disk..."
+            mkfs.ext4 -q /dev/vda
+        fi
+
+        mkdir -p /overlay
+        mount /dev/vda /overlay
+        mkdir -p /overlay/upper /overlay/work
+
+        mkdir -p /newroot
+        mount -t overlay overlay \
+            -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work \
+            /newroot
+
+        # Move the essential virtual filesystems into the new root. Their
+        # target dirs are visible via the lower layer.
+        mount --move /proc /newroot/proc
+        mount --move /sys  /newroot/sys
+        mount --move /dev  /newroot/dev
+        mount --move /run  /newroot/run
+        mount --move /tmp  /newroot/tmp
+
+        # Re-exec this same /init under the merged rootfs view as stage 2.
+        # /overlay is outside the chroot and thus invisible from here on.
+        PEN_INIT_STAGE2=1
+        export PEN_INIT_STAGE2
+        exec chroot /newroot /init
+    fi
+    # No overlay disk — fall through to stage 2 in the initramfs (ephemeral).
 fi
 
-# Mount workspace via virtio-fs if available
+# ===== STAGE 2 =====
 mkdir -p /workspace
 mount -t virtiofs workspace /workspace 2>/dev/null && echo "workspace mounted at /workspace" || true
 

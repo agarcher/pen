@@ -18,11 +18,12 @@ import (
 )
 
 var (
-	shellDir     string
-	shellCPUs    uint
-	shellMem     uint64
-	shellEnv     []string // KEY=VALUE pairs
-	shellEnvHost []string // key names to pass from host env
+	shellDir      string
+	shellCPUs     uint
+	shellMem      uint64
+	shellEnv      []string // KEY=VALUE pairs
+	shellEnvHost  []string // key names to pass from host env
+	shellDiskSize string
 )
 
 func init() {
@@ -31,6 +32,7 @@ func init() {
 	shellCmd.Flags().Uint64Var(&shellMem, "memory", 2048, "Memory in MB")
 	shellCmd.Flags().StringArrayVar(&shellEnv, "env", nil, "Set env var in guest (KEY=VALUE)")
 	shellCmd.Flags().StringArrayVar(&shellEnvHost, "env-from-host", nil, "Pass env var from host to guest (KEY)")
+	shellCmd.Flags().StringVar(&shellDiskSize, "disk-size", "10G", "Overlay disk size (first boot only; ignored thereafter)")
 	rootCmd.AddCommand(shellCmd)
 }
 
@@ -111,6 +113,18 @@ func runShell(cmd *cobra.Command, args []string) error {
 		defer envject.CleanupEnvFile(dir)
 	}
 
+	// Ensure the per-VM overlay disk exists. Sized only on first creation;
+	// the --disk-size flag is silently ignored on subsequent boots since the
+	// file already has its final size.
+	diskSize, err := vm.ParseDiskSize(shellDiskSize)
+	if err != nil {
+		return fmt.Errorf("--disk-size: %w", err)
+	}
+	overlay, err := vm.EnsureOverlay(name, diskSize)
+	if err != nil {
+		return err
+	}
+
 	hyp := virt.NewAppleHypervisor()
 
 	fmt.Fprintf(cmd.ErrOrStderr(), "pen: booting %s (cpus=%d mem=%dMB dir=%s)\n", name, shellCPUs, shellMem, dir)
@@ -122,8 +136,12 @@ func runShell(cmd *cobra.Command, args []string) error {
 		CmdLine:    "console=hvc0",
 		CPUs:       shellCPUs,
 		MemoryMB:   shellMem,
-		ShareDir:   dir,
-		ShareTag:   "workspace",
+		Shares: []virt.Share{
+			{HostPath: dir, Tag: "workspace"},
+		},
+		Disks: []virt.Disk{
+			{ImagePath: overlay},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("creating VM: %w", err)
