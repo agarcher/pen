@@ -7,7 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 )
+
+// httpClient is used for image downloads. The timeout covers the full
+// request including the body transfer, so it must be generous enough for
+// a multi-megabyte initrd over a slow connection.
+var httpClient = &http.Client{
+	Timeout: 5 * time.Minute,
+}
 
 const (
 	configDir  = ".config/pen"
@@ -121,7 +129,7 @@ func download(dir string) error {
 // downloadFile fetches a URL to a local path. It writes to a temp file
 // first to avoid leaving partial files on failure.
 func downloadFile(url, dest string) error {
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return err
 	}

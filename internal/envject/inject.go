@@ -9,11 +9,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
 // EnvFileName is the name of the env file written to the shared directory.
 const EnvFileName = ".pen-env"
+
+// envNameRE matches valid POSIX shell variable names.
+var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ValidateName returns an error if name is not a valid shell variable name.
+// A valid name starts with a letter or underscore and contains only letters,
+// digits, and underscores. This catches typos like "FOO-BAR" or "1FOO" before
+// they produce a broken env file in the guest.
+func ValidateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("env var name is empty")
+	}
+	if !envNameRE.MatchString(name) {
+		return fmt.Errorf("invalid env var name %q (must match [A-Za-z_][A-Za-z0-9_]*)", name)
+	}
+	return nil
+}
 
 // EnvSpec describes environment variables to inject.
 type EnvSpec struct {
@@ -52,6 +70,9 @@ func WriteEnvFile(shareDir string, spec *EnvSpec) error {
 
 	var b strings.Builder
 	for k, v := range env {
+		if err := ValidateName(k); err != nil {
+			return err
+		}
 		// Shell-safe: single-quote the value, escaping embedded single quotes.
 		fmt.Fprintf(&b, "export %s='%s'\n", k, strings.ReplaceAll(v, "'", "'\\''"))
 	}

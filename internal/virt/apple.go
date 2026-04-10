@@ -39,17 +39,30 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 	}
 
 	// Port 0: interactive console (hvc0) — bidirectional pipes.
+	// Track all created pipes so we can close them on any error path.
+	var pipes []*os.File
+	cleanupPipes := func() {
+		for _, p := range pipes {
+			p.Close()
+		}
+	}
+
 	guestIn, hostOut, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("creating guest input pipe: %w", err)
 	}
+	pipes = append(pipes, guestIn, hostOut)
+
 	hostIn, guestOut, err := os.Pipe()
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating guest output pipe: %w", err)
 	}
+	pipes = append(pipes, hostIn, guestOut)
 
 	consoleAttachment, err := vz.NewFileHandleSerialPortAttachment(guestIn, guestOut)
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating console attachment: %w", err)
 	}
 
@@ -58,11 +71,13 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 		vz.WithVirtioConsolePortConfigurationIsConsole(true),
 	)
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating console port config: %w", err)
 	}
 
 	consoleDevice, err := vz.NewVirtioConsoleDeviceConfiguration()
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating console device config: %w", err)
 	}
 	consoleDevice.SetVirtioConsolePortConfiguration(0, consolePort)
@@ -71,6 +86,7 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 	// Entropy device (recommended for Linux guests).
 	entropyDevice, err := vz.NewVirtioEntropyDeviceConfiguration()
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating entropy device: %w", err)
 	}
 	vzConfig.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropyDevice})
@@ -78,10 +94,12 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 	// Network: NAT.
 	natAttachment, err := vz.NewNATNetworkDeviceAttachment()
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating NAT attachment: %w", err)
 	}
 	netDevice, err := vz.NewVirtioNetworkDeviceConfiguration(natAttachment)
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating network device: %w", err)
 	}
 	vzConfig.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{netDevice})
@@ -94,14 +112,17 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 		}
 		sharedDir, err := vz.NewSharedDirectory(cfg.ShareDir, false)
 		if err != nil {
+			cleanupPipes()
 			return nil, fmt.Errorf("creating shared directory: %w", err)
 		}
 		share, err := vz.NewSingleDirectoryShare(sharedDir)
 		if err != nil {
+			cleanupPipes()
 			return nil, fmt.Errorf("creating directory share: %w", err)
 		}
 		fsDevice, err := vz.NewVirtioFileSystemDeviceConfiguration(tag)
 		if err != nil {
+			cleanupPipes()
 			return nil, fmt.Errorf("creating virtio-fs device: %w", err)
 		}
 		fsDevice.SetDirectoryShare(share)
@@ -110,14 +131,17 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 
 	validated, err := vzConfig.Validate()
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("validating VM config: %w", err)
 	}
 	if !validated {
+		cleanupPipes()
 		return nil, fmt.Errorf("VM configuration is not valid")
 	}
 
 	machine, err := vz.NewVirtualMachine(vzConfig)
 	if err != nil {
+		cleanupPipes()
 		return nil, fmt.Errorf("creating virtual machine: %w", err)
 	}
 
@@ -139,11 +163,9 @@ type appleVM struct {
 func (vm *appleVM) Start() error {
 	vm.done = make(chan struct{})
 
-	if err := vm.machine.Start(); err != nil {
-		return fmt.Errorf("starting VM: %w", err)
-	}
-
-	// Monitor state changes and close done when the VM stops.
+	// Start monitoring state changes BEFORE calling machine.Start so we
+	// don't miss early Stopped/Error transitions (e.g., immediate boot
+	// failures), which would otherwise leave Wait() blocked forever.
 	go func() {
 		ch := vm.machine.StateChangedNotify()
 		for state := range ch {
@@ -153,6 +175,10 @@ func (vm *appleVM) Start() error {
 			}
 		}
 	}()
+
+	if err := vm.machine.Start(); err != nil {
+		return fmt.Errorf("starting VM: %w", err)
+	}
 
 	return nil
 }

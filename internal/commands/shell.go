@@ -68,10 +68,18 @@ func runShell(cmd *cobra.Command, args []string) error {
 		FromHost: shellEnvHost,
 		Explicit: make(map[string]string),
 	}
+	for _, key := range shellEnvHost {
+		if err := envject.ValidateName(key); err != nil {
+			return fmt.Errorf("--env-from-host: %w", err)
+		}
+	}
 	for _, e := range shellEnv {
 		k, v, ok := strings.Cut(e, "=")
 		if !ok {
 			return fmt.Errorf("invalid --env value %q (expected KEY=VALUE)", e)
+		}
+		if err := envject.ValidateName(k); err != nil {
+			return fmt.Errorf("--env: %w", err)
 		}
 		spec.Explicit[k] = v
 	}

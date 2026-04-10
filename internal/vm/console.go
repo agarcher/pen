@@ -4,14 +4,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	"golang.org/x/term"
 )
 
 // AttachConsole connects stdin/stdout to the VM console in raw terminal mode.
-// It blocks until the VM's reader returns EOF or an error occurs.
+// It returns when the VM's reader closes (guest exited) or a signal is received.
+// The stdin-copy goroutine is intentionally not waited on — io.Copy on os.Stdin
+// can block indefinitely after the guest exits, since the host stdin remains open.
 // The terminal is restored to its original state on return.
 func AttachConsole(vmReader io.Reader, vmWriter io.Writer) error {
 	fd := int(os.Stdin.Fd())
@@ -23,42 +24,29 @@ func AttachConsole(vmReader io.Reader, vmWriter io.Writer) error {
 		defer term.Restore(fd, oldState)
 	}
 
-	// Handle terminal resize (SIGWINCH) - not applicable to virtio console
-	// but we do handle SIGTERM/SIGINT to restore the terminal.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(sigCh)
 
-	var wg sync.WaitGroup
+	guestDone := make(chan struct{})
 
-	// Guest → host stdout.
-	wg.Add(1)
+	// Guest → host stdout. Closes guestDone when the guest closes its output.
 	go func() {
-		defer wg.Done()
-		io.Copy(os.Stdout, vmReader)
+		_, _ = io.Copy(os.Stdout, vmReader)
+		close(guestDone)
 	}()
 
-	// Host stdin → guest.
-	wg.Add(1)
+	// Host stdin → guest. Not awaited: a blocked Read on os.Stdin would
+	// otherwise prevent return after guest exit. The goroutine is leaked
+	// for the brief lifetime of the process.
 	go func() {
-		defer wg.Done()
-		io.Copy(vmWriter, os.Stdin)
+		_, _ = io.Copy(vmWriter, os.Stdin)
 	}()
 
-	// Wait for signal or guest EOF (the io.Copy from vmReader will return).
 	select {
 	case <-sigCh:
-	case <-waitForGroup(&wg):
+	case <-guestDone:
 	}
 
 	return nil
-}
-
-func waitForGroup(wg *sync.WaitGroup) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-	return ch
 }
