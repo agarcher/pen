@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/Code-Hex/vz/v3"
 )
@@ -183,14 +184,43 @@ func (vm *appleVM) Start() error {
 	return nil
 }
 
+// Stop blocks until the VM has fully stopped. It first attempts a graceful
+// ACPI shutdown via RequestStop, and falls back to a forceful Stop if the
+// guest does not honor the ACPI signal within the timeout.
+//
+// In our minimal Alpine image there is no acpid/systemd to handle the
+// ACPI power event, so the graceful path almost always falls through —
+// but the structure is in place for future images that include one.
+//
+// This method is safe to call multiple times. Once the VM has stopped,
+// subsequent calls return immediately.
 func (vm *appleVM) Stop() error {
+	if vm.machine.State() == vz.VirtualMachineStateStopped ||
+		vm.machine.State() == vz.VirtualMachineStateError {
+		return nil
+	}
+
+	const gracefulTimeout = 2 * time.Second
+
 	if vm.machine.CanRequestStop() {
-		_, err := vm.machine.RequestStop()
-		return err
+		if _, err := vm.machine.RequestStop(); err == nil {
+			select {
+			case <-vm.done:
+				return nil
+			case <-time.After(gracefulTimeout):
+				// Fall through to forceful stop.
+			}
+		}
 	}
+
 	if vm.machine.CanStop() {
-		return vm.machine.Stop()
+		if err := vm.machine.Stop(); err != nil {
+			return fmt.Errorf("forcing stop: %w", err)
+		}
 	}
+
+	// Wait for the state machine to settle.
+	<-vm.done
 	return nil
 }
 

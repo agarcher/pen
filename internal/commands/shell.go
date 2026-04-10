@@ -2,9 +2,12 @@ package commands
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agarcher/pen/internal/envject"
@@ -48,11 +51,6 @@ Environment variables can be injected into the guest:
 func runShell(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// Check if this VM is already running in another process.
-	if vm.IsRunning(name) {
-		return fmt.Errorf("VM %q is already running (PID %d)", name, vm.ReadPID(name))
-	}
-
 	imgs, err := image.Resolve()
 	if err != nil {
 		return err
@@ -84,14 +82,6 @@ func runShell(cmd *cobra.Command, args []string) error {
 		spec.Explicit[k] = v
 	}
 
-	// Write env file to shared dir before boot so guest init can read it.
-	if !spec.IsEmpty() {
-		if err := envject.WriteEnvFile(dir, spec); err != nil {
-			return fmt.Errorf("writing env file: %w", err)
-		}
-		defer envject.CleanupEnvFile(dir)
-	}
-
 	// Persist VM state.
 	state := &vm.VMState{
 		Name:      name,
@@ -104,11 +94,22 @@ func runShell(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving VM state: %w", err)
 	}
 
-	// Write PID so other processes can detect this VM is running.
-	if err := vm.WritePID(name); err != nil {
-		return fmt.Errorf("writing PID file: %w", err)
+	// Acquire exclusive lock for the lifetime of this VM. Fails fast if
+	// another pen shell is already running this VM. Released on return
+	// (and automatically by the OS if we crash).
+	lock, err := vm.AcquireLock(name)
+	if err != nil {
+		return err
 	}
-	defer vm.ClearPID(name)
+	defer lock.Release()
+
+	// Write env file to shared dir before boot so guest init can read it.
+	if !spec.IsEmpty() {
+		if err := envject.WriteEnvFile(dir, spec); err != nil {
+			return fmt.Errorf("writing env file: %w", err)
+		}
+		defer envject.CleanupEnvFile(dir)
+	}
 
 	hyp := virt.NewAppleHypervisor()
 
@@ -132,10 +133,33 @@ func runShell(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
+	// Install signal handler for graceful shutdown. SIGTERM (sent by
+	// `pen stop`) and SIGINT trigger an ACPI request-stop on the VM,
+	// giving the guest kernel a chance to sync filesystems before halting.
+	// Without this, the Go runtime would terminate this process on
+	// SIGTERM and the VM would be killed mid-flight.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		if _, ok := <-sigCh; !ok {
+			return
+		}
+		fmt.Fprintln(cmd.ErrOrStderr(), "\npen: stopping VM...")
+		if err := v.Stop(); err != nil {
+			fmt.Fprintln(cmd.ErrOrStderr(), "pen: stop request failed:", err)
+		}
+	}()
+
+	// Attach the console; returns when the guest closes its output
+	// (either user typed exit, or the signal handler triggered v.Stop).
 	reader, writer := v.Console()
 	if err := vm.AttachConsole(reader, writer); err != nil {
 		return fmt.Errorf("attaching console: %w", err)
 	}
 
-	return v.Stop()
+	// Ensure the VM is fully stopped before we release the lock and exit.
+	// Stop is idempotent; Wait blocks until the state machine settles.
+	v.Stop()
+	return v.Wait()
 }

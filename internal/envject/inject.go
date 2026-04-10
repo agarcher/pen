@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // EnvFileName is the name of the env file written to the shared directory.
@@ -77,9 +78,24 @@ func WriteEnvFile(shareDir string, spec *EnvSpec) error {
 		fmt.Fprintf(&b, "export %s='%s'\n", k, strings.ReplaceAll(v, "'", "'\\''"))
 	}
 
+	// Open with O_EXCL|O_NOFOLLOW so a precreated .pen-env symlink in an
+	// untrusted workspace cannot redirect this write to a sensitive host
+	// file (e.g., a symlink → ~/.zshrc would otherwise have its target
+	// clobbered with the injected secrets). If the file already exists,
+	// we refuse rather than overwrite.
 	path := filepath.Join(shareDir, EnvFileName)
-	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return fmt.Errorf("creating env file: %w", err)
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(path)
 		return fmt.Errorf("writing env file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("closing env file: %w", err)
 	}
 
 	return nil
