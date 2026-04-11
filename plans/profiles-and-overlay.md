@@ -1,6 +1,6 @@
 # Profiles, Custom Images, and Per-VM Overlay Disks
 
-**Status:** Ready to implement
+**Status:** Phase 1 complete (overlay disk plumbing). Phases 2–4 not started.
 **Scope:** Combines first-boot setup (#4), custom images (#1), and per-VM overlay disks (#2) into a single coherent feature.
 
 ## Goal
@@ -33,7 +33,7 @@ This is "Option 1" from prior design discussion: simple, predictable, sacrifices
 
 The first-boot-setup-complete marker lives at **`/var/lib/pen/setup-done`** — a normal file inside the merged rootfs view that physically lands on the overlay disk's `upper/` directory via normal overlayfs copy-up.
 
-This was chosen over the alternative of placing the marker at the raw disk root (e.g. `/overlay/.pen-setup-done`, a sibling of `upper/` and `work/`) for one deciding reason: **it lets the init script fully hide `/overlay` after pivot_root**, so no post-pivot code path needs raw access to the disk. The setup hook then runs in a plain rootfs environment and can check/touch the marker with normal shell operations, with no mount gymnastics and no error handling across the pivot boundary.
+This was chosen over the alternative of placing the marker at the raw disk root (e.g. `/overlay/.pen-setup-done`, a sibling of `upper/` and `work/`) for one deciding reason: **it lets the init script fully hide `/overlay` after the chroot into the merged rootfs**, so no post-chroot code path needs raw access to the disk. The setup hook then runs in a plain rootfs environment and can check/touch the marker with normal shell operations, with no mount gymnastics and no error handling across the chroot boundary.
 
 The tradeoff accepted: the marker lives in a user-visible location and could theoretically be clobbered by a misbehaving setup script or `rm -rf /var/lib`. This is a remote risk that would break other things first, and is worth the simpler init sequence paid on every boot.
 
@@ -114,31 +114,43 @@ The existing init script (in `images/alpine/build.sh`) runs as PID 1 and mounts 
 ### New init flow
 
 ```
-1. Mount proc, sys, dev, tmp, run, devpts                    (unchanged)
-2. Detect overlay disk at /dev/vda
-   - If absent: skip to step 4 (ephemeral mode, back-compat)
-   - If present and unformatted: mkfs.ext4 /dev/vda
-3. Mount /dev/vda at /overlay; mkdir /overlay/upper /overlay/work
-4. If overlay present:
-   a. mkdir /newroot
-   b. mount -t overlay overlay \
-        -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /newroot
-   c. Move /proc, /sys, /dev, /run into /newroot
-   d. pivot_root /newroot /newroot/.oldroot
-   e. umount /.oldroot/overlay; umount /.oldroot; rmdir /.oldroot
-   (after this point, /overlay is no longer visible — the marker lives inside
-    the merged rootfs view and no post-pivot raw-disk access is needed)
-5. Bring up loopback, eth0/DHCP                              (unchanged)
-6. Mount /workspace via virtio-fs                            (unchanged — post-pivot)
-7. Read injected env vars from /workspace/.pen-env           (unchanged)
-8. First-boot hook:
-   - Check if kernel cmdline has `pen.mode=build` → run build flow (see Image build pipeline)
-   - Else check for /var/lib/pen/setup-done marker
-     - Absent AND setup script present in env → run it; on success
-       `mkdir -p /var/lib/pen && touch /var/lib/pen/setup-done`
-       (the file lands on the overlay's upper layer via normal overlayfs copy-up)
-     - Present → skip
-9. exec /bin/sh -l                                           (unchanged)
+=== stage 1 (bare initramfs, PEN_INIT_STAGE2 unset) ===
+
+1. Mount proc, sys, dev, tmp, run, devpts
+2. modprobe virtio_blk, virtio_net, virtiofs, overlay, ext4
+   (the alpine virt kernel ships these as loadable modules in
+    /lib/modules/<kver>/, grafted into the rootfs at image build time)
+3. Bring up loopback + eth0, run udhcpc in foreground
+   (network must be up before the first-boot apk-install path)
+4. /dev/vda is mandatory. If absent → error + poweroff -f.
+   If unformatted: apk add e2fsprogs (lazy, first boot only),
+   then mkfs.ext4 -F /dev/vda. Any failure → error + poweroff -f.
+5. mount -t ext4 /dev/vda /overlay; mkdir /overlay/{upper,work}
+6. mkdir /newroot && mount -t overlay overlay \
+     -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /newroot
+7. mount --move /proc /sys /dev /run /tmp into /newroot
+8. PEN_INIT_STAGE2=1 exec chroot /newroot /init
+   (chroot, not pivot_root: the kernel forbids pivot_root from initramfs.
+    /overlay sits outside the chroot and is invisible from here on, so no
+    post-chroot cleanup of the raw disk path is needed)
+
+=== stage 2 (inside the merged rootfs, PEN_INIT_STAGE2=1) ===
+
+9.  Mount /workspace via virtio-fs
+10. Read injected env vars from /workspace/.pen-env → /run/pen-env → delete
+11. First-boot hook (Phase 2):
+    - Check if kernel cmdline has `pen.mode=build` → run build flow
+      (see Image build pipeline — Phase 3)
+    - Else check for /var/lib/pen/setup-done marker
+      - Absent AND setup script present in env → run it; on success
+        `mkdir -p /var/lib/pen && touch /var/lib/pen/setup-done`
+        (the file lands on the overlay's upper layer via normal copy-up)
+      - Present → skip
+12. /bin/sh -l                                    (as a child, NOT exec)
+13. sync && poweroff -f                           (on shell exit)
+    (poweroff, not exec-then-exit: letting PID 1 exit kernel-panics, and
+     Apple's Virtualization.framework does not surface that as a state
+     transition, so pen would hang forever on a dead console pipe)
 ```
 
 ### Where the setup script comes from
@@ -192,7 +204,7 @@ Custom images are built by booting a **builder VM** that uses the base pen image
   ```go
   type VMConfig struct {
       // ...existing fields...
-      Shares []Share         // replaces ShareDir/ShareTag (with back-compat shim if needed)
+      Shares []Share         // replaces ShareDir/ShareTag, no compat shim
       Disks  []Disk          // new: block devices
   }
   type Share struct { HostPath, Tag string; ReadOnly bool }
@@ -208,15 +220,17 @@ Custom images are built by booting a **builder VM** that uses the base pen image
 - **Attachment:** wired into `VMConfig.Disks` as the sole (initially) block device, appears as `/dev/vda` in the guest.
 - **Sizing:** default 10G sparse; actual host footprint grows only as the guest writes to it. `--disk-size` on first `pen shell` overrides; ignored thereafter.
 - **Resize:** explicitly out of scope for v1. User can `pen delete` and recreate if they need more space.
-- **Back-compat:** if a VM has no `overlay.img` (e.g., created before this feature, or the user passed `--no-disk`), init skips the overlay stage and runs in the existing stateless mode. This keeps existing workflows working.
+- **Required, not optional:** the overlay disk is unconditionally attached and its ext4 mount + overlayfs is a hard prerequisite for shell startup. Any failure during stage 1 (no `/dev/vda`, mkfs failure, mount failure, network required for first-boot e2fsprogs install unavailable, etc.) prints an error and powers the VM off cleanly. There is no "ephemeral fallback" mode — pen has no users yet, so there is nothing to be backwards-compatible with.
 
 ## Implementation phases
 
 Each phase ships a usable, testable slice. Land one at a time.
 
-### Phase 1 — Overlay disk plumbing (no profiles yet)
+### Phase 1 — Overlay disk plumbing (no profiles yet) ✅ DONE
 
 Goal: `apk add` inside a `pen shell` session persists across reboots.
+
+Landed in commits `5fb2726`, `c679bec`, `001f3f1`. Verified end-to-end by `internal/integration/TestOverlayPersistence` (`make test-integration`): boot a fresh VM, `apk add vim`, `exit`, boot the same VM again, `which vim` still returns `/usr/bin/vim`. Ext4 journal replay confirmed clean on the second boot.
 
 - **Breaking `VMConfig` shape change** (internal only — `virt` is not a public package):
   - Replace `ShareDir`/`ShareTag` with `Shares []Share` (each with `HostPath`, `Tag`, `ReadOnly`).
@@ -224,13 +238,13 @@ Goal: `apk add` inside a `pen shell` session persists across reboots.
   - Wire `VirtioBlockDeviceConfiguration` + `DiskImageStorageDeviceAttachment` in `apple.go`.
   - Migrate the sole caller (`internal/commands/shell.go`) in the same PR — do not leave a compatibility shim.
 - **Base image additions to `images/alpine/build.sh`:**
-  - Add `e2fsprogs` to the apk package list so the guest has `mkfs.ext4` available on first boot. (Busybox has `mount`, `pivot_root`, `cpio`, `gzip` built in — no other additions needed.)
-- Create `overlay.img` lazily under `~/.config/pen/vms/<name>/` in `pen shell` if absent (sparse file via `os.Truncate`).
-- Update the guest init script to detect `/dev/vda`, mkfs if unformatted, set up overlayfs, pivot_root.
+  - Stop using `netboot/vmlinuz-virt` + `netboot/initramfs-virt`. The netboot files lag the main repo and the shipped `initramfs-virt` omits ext4, jbd2, mbcache, libcrc32c. Instead, resolve `linux-virt` from the main APKINDEX and download the full `linux-virt-<ver>.apk`, which ships a matched-version kernel *and* the full `/lib/modules/<kver>/` tree. Extract `boot/vmlinuz-virt` as the kernel and graft `lib/modules/` into the rootfs.
+  - e2fsprogs is lazy-installed via `apk add` on the very first boot of a fresh VM (there is no host-side `apk` on macOS, and Phase 3's builder VM replaces this altogether).
+- Create `overlay.img` lazily under `~/.config/pen/vms/<name>/` in `pen shell` (sparse file via `os.Truncate`).
+- Update the guest init script: modprobe `virtio_blk virtio_net virtiofs overlay ext4`, wait for eth0, run `udhcpc -s /usr/share/udhcpc/default.script` (the Alpine default script path), lazy-install e2fsprogs if needed, mkfs.ext4 the fresh disk, mount `-t ext4` explicitly (busybox `mount` autodetection returns EINVAL on unpartitioned whole-disk ext4), compose overlayfs, move mounts, chroot into stage 2, exec `/bin/sh -l`, then `poweroff -f` on shell exit (letting PID 1 exit would kernel-panic and Apple's Virtualization.framework does not surface that as a state transition).
 - Add `--disk-size` flag (first-boot only).
 - Update `pen delete` to remove `overlay.img`.
 - Test: `apk add vim`, exit, `pen shell`, verify `vim` still present.
-- Test: back-compat — when no `/dev/vda` is present the init falls through to the existing stateless path cleanly.
 
 ### Phase 2 — Profiles and first-boot setup hook
 
@@ -266,12 +280,11 @@ Goal: profile `packages` + `build` produce a cached custom initrd reused across 
 ## Testing strategy
 
 - **Unit tests** for profile parsing, hash computation, disk file creation, config merging.
-- **Integration tests** (macOS-only, same gate as existing `make test-integration`):
-  - Overlay persistence: install a package, reboot VM, verify presence.
-  - Profile setup idempotency: run setup, reboot, confirm marker prevents re-run.
-  - Image build determinism: same profile → same hash → cache hit.
-  - Builder VM smoke test: build a tiny profile with one package, verify the produced initrd is usable.
-- **Back-compat test:** existing `pen shell foo --dir .` (no profile, no disk flag) still works; the new init's overlay stage is a no-op when `/dev/vda` is absent.
+- **Integration tests** (macOS-only, `make test-integration`, local-only — GitHub hosted macOS runners are themselves Anka VMs and Apple VZ refuses nested virt; see `docs/ARCHITECTURE.md`):
+  - Overlay persistence: install a package, reboot VM, verify presence. *(Phase 1 — shipped as `internal/integration/TestOverlayPersistence`.)*
+  - Profile setup idempotency: run setup, reboot, confirm marker prevents re-run. *(Phase 2.)*
+  - Image build determinism: same profile → same hash → cache hit. *(Phase 3.)*
+  - Builder VM smoke test: build a tiny profile with one package, verify the produced initrd is usable. *(Phase 3.)*
 
 ## Non-goals (for this plan)
 
@@ -290,6 +303,6 @@ The builder VM in Phase 3 needs two simultaneous virtio-fs shares (`control` rea
 
 **Action:** as the **first task of Phase 3**, write a throwaway smoke test that boots a minimal VM with two shares and verifies both are mounted inside the guest. Do this *before* building the rest of the builder pipeline — if it doesn't work, the entire image-build approach needs rethinking and it's better to discover that early.
 
-### 2. Disk-not-clean recovery
+### 2. Disk-not-clean recovery ✅ resolved
 
-If a VM crashes mid-write (e.g., host `kill -9` the pen process), ext4 journal replay on next boot should handle it. Validate in Phase 1 by forcibly killing pen during heavy writes and confirming the next boot is clean — if journal replay doesn't happen automatically under the busybox init, we may need an explicit `e2fsck -p /dev/vda` step before mounting.
+Confirmed during Phase 1 smoke testing: after an unclean shutdown (kernel panic on an earlier buggy build that left the ext4 dirty), the next boot logged `EXT4-fs (vda): recovery complete` and mounted successfully with no `e2fsck` step required. Journal replay works out of the box under busybox mount; no guard needed.

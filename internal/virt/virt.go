@@ -2,6 +2,20 @@ package virt
 
 import "io"
 
+// Share is a host directory exposed to the guest via virtio-fs.
+type Share struct {
+	HostPath string
+	Tag      string
+	ReadOnly bool
+}
+
+// Disk is a host file exposed to the guest as a virtio-blk block device.
+// The first attached disk appears as /dev/vda inside the guest.
+type Disk struct {
+	ImagePath string
+	ReadOnly  bool
+}
+
 // VMConfig holds configuration for creating a virtual machine.
 type VMConfig struct {
 	Name       string
@@ -10,8 +24,8 @@ type VMConfig struct {
 	CmdLine    string
 	CPUs       uint
 	MemoryMB   uint64
-	ShareDir   string // Host directory to share via virtio-fs (empty = none)
-	ShareTag   string // virtio-fs mount tag (default: "workspace")
+	Shares     []Share
+	Disks      []Disk
 }
 
 // VM represents a running virtual machine.

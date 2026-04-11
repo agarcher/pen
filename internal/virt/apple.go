@@ -105,29 +105,52 @@ func (h *AppleHypervisor) CreateVM(cfg VMConfig) (VM, error) {
 	}
 	vzConfig.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{netDevice})
 
-	// Directory sharing (virtio-fs).
-	if cfg.ShareDir != "" {
-		tag := cfg.ShareTag
-		if tag == "" {
-			tag = "workspace"
+	// Directory sharing (virtio-fs). One device per Share entry.
+	if len(cfg.Shares) > 0 {
+		fsDevices := make([]vz.DirectorySharingDeviceConfiguration, 0, len(cfg.Shares))
+		for _, s := range cfg.Shares {
+			tag := s.Tag
+			if tag == "" {
+				tag = "workspace"
+			}
+			sharedDir, err := vz.NewSharedDirectory(s.HostPath, s.ReadOnly)
+			if err != nil {
+				cleanupPipes()
+				return nil, fmt.Errorf("creating shared directory %q: %w", s.HostPath, err)
+			}
+			share, err := vz.NewSingleDirectoryShare(sharedDir)
+			if err != nil {
+				cleanupPipes()
+				return nil, fmt.Errorf("creating directory share %q: %w", s.HostPath, err)
+			}
+			fsDevice, err := vz.NewVirtioFileSystemDeviceConfiguration(tag)
+			if err != nil {
+				cleanupPipes()
+				return nil, fmt.Errorf("creating virtio-fs device %q: %w", tag, err)
+			}
+			fsDevice.SetDirectoryShare(share)
+			fsDevices = append(fsDevices, fsDevice)
 		}
-		sharedDir, err := vz.NewSharedDirectory(cfg.ShareDir, false)
-		if err != nil {
-			cleanupPipes()
-			return nil, fmt.Errorf("creating shared directory: %w", err)
+		vzConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsDevices)
+	}
+
+	// Block devices (virtio-blk). The first disk appears as /dev/vda.
+	if len(cfg.Disks) > 0 {
+		storageDevices := make([]vz.StorageDeviceConfiguration, 0, len(cfg.Disks))
+		for _, d := range cfg.Disks {
+			attachment, err := vz.NewDiskImageStorageDeviceAttachment(d.ImagePath, d.ReadOnly)
+			if err != nil {
+				cleanupPipes()
+				return nil, fmt.Errorf("creating disk attachment %q: %w", d.ImagePath, err)
+			}
+			blockDevice, err := vz.NewVirtioBlockDeviceConfiguration(attachment)
+			if err != nil {
+				cleanupPipes()
+				return nil, fmt.Errorf("creating block device %q: %w", d.ImagePath, err)
+			}
+			storageDevices = append(storageDevices, blockDevice)
 		}
-		share, err := vz.NewSingleDirectoryShare(sharedDir)
-		if err != nil {
-			cleanupPipes()
-			return nil, fmt.Errorf("creating directory share: %w", err)
-		}
-		fsDevice, err := vz.NewVirtioFileSystemDeviceConfiguration(tag)
-		if err != nil {
-			cleanupPipes()
-			return nil, fmt.Errorf("creating virtio-fs device: %w", err)
-		}
-		fsDevice.SetDirectoryShare(share)
-		vzConfig.SetDirectorySharingDevicesVirtualMachineConfiguration([]vz.DirectorySharingDeviceConfiguration{fsDevice})
+		vzConfig.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 	}
 
 	validated, err := vzConfig.Validate()
@@ -171,7 +194,14 @@ func (vm *appleVM) Start() error {
 		ch := vm.machine.StateChangedNotify()
 		for state := range ch {
 			if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
-				vm.once.Do(func() { close(vm.done) })
+				vm.once.Do(func() {
+					// Close the host read side of the console pipe so
+					// io.Copy in AttachConsole sees EOF and returns.
+					if vm.hostIn != nil {
+						vm.hostIn.Close()
+					}
+					close(vm.done)
+				})
 				return
 			}
 		}
