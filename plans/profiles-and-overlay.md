@@ -33,7 +33,7 @@ This is "Option 1" from prior design discussion: simple, predictable, sacrifices
 
 The first-boot-setup-complete marker lives at **`/var/lib/pen/setup-done`** — a normal file inside the merged rootfs view that physically lands on the overlay disk's `upper/` directory via normal overlayfs copy-up.
 
-This was chosen over the alternative of placing the marker at the raw disk root (e.g. `/overlay/.pen-setup-done`, a sibling of `upper/` and `work/`) for one deciding reason: **it lets the init script fully hide `/overlay` after pivot_root**, so no post-pivot code path needs raw access to the disk. The setup hook then runs in a plain rootfs environment and can check/touch the marker with normal shell operations, with no mount gymnastics and no error handling across the pivot boundary.
+This was chosen over the alternative of placing the marker at the raw disk root (e.g. `/overlay/.pen-setup-done`, a sibling of `upper/` and `work/`) for one deciding reason: **it lets the init script fully hide `/overlay` after the chroot into the merged rootfs**, so no post-chroot code path needs raw access to the disk. The setup hook then runs in a plain rootfs environment and can check/touch the marker with normal shell operations, with no mount gymnastics and no error handling across the chroot boundary.
 
 The tradeoff accepted: the marker lives in a user-visible location and could theoretically be clobbered by a misbehaving setup script or `rm -rf /var/lib`. This is a remote risk that would break other things first, and is worth the simpler init sequence paid on every boot.
 
@@ -114,31 +114,43 @@ The existing init script (in `images/alpine/build.sh`) runs as PID 1 and mounts 
 ### New init flow
 
 ```
-1. Mount proc, sys, dev, tmp, run, devpts                    (unchanged)
-2. Detect overlay disk at /dev/vda
-   - If absent: skip to step 4 (ephemeral mode, back-compat)
-   - If present and unformatted: mkfs.ext4 /dev/vda
-3. Mount /dev/vda at /overlay; mkdir /overlay/upper /overlay/work
-4. If overlay present:
-   a. mkdir /newroot
-   b. mount -t overlay overlay \
-        -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /newroot
-   c. Move /proc, /sys, /dev, /run into /newroot
-   d. pivot_root /newroot /newroot/.oldroot
-   e. umount /.oldroot/overlay; umount /.oldroot; rmdir /.oldroot
-   (after this point, /overlay is no longer visible — the marker lives inside
-    the merged rootfs view and no post-pivot raw-disk access is needed)
-5. Bring up loopback, eth0/DHCP                              (unchanged)
-6. Mount /workspace via virtio-fs                            (unchanged — post-pivot)
-7. Read injected env vars from /workspace/.pen-env           (unchanged)
-8. First-boot hook:
-   - Check if kernel cmdline has `pen.mode=build` → run build flow (see Image build pipeline)
-   - Else check for /var/lib/pen/setup-done marker
-     - Absent AND setup script present in env → run it; on success
-       `mkdir -p /var/lib/pen && touch /var/lib/pen/setup-done`
-       (the file lands on the overlay's upper layer via normal overlayfs copy-up)
-     - Present → skip
-9. exec /bin/sh -l                                           (unchanged)
+=== stage 1 (bare initramfs, PEN_INIT_STAGE2 unset) ===
+
+1. Mount proc, sys, dev, tmp, run, devpts
+2. modprobe virtio_blk, virtio_net, virtiofs, overlay, ext4
+   (the alpine virt kernel ships these as loadable modules in
+    /lib/modules/<kver>/, grafted into the rootfs at image build time)
+3. Bring up loopback + eth0, run udhcpc in foreground
+   (network must be up before the first-boot apk-install path)
+4. /dev/vda is mandatory. If absent → error + poweroff -f.
+   If unformatted: apk add e2fsprogs (lazy, first boot only),
+   then mkfs.ext4 -F /dev/vda. Any failure → error + poweroff -f.
+5. mount -t ext4 /dev/vda /overlay; mkdir /overlay/{upper,work}
+6. mkdir /newroot && mount -t overlay overlay \
+     -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /newroot
+7. mount --move /proc /sys /dev /run /tmp into /newroot
+8. PEN_INIT_STAGE2=1 exec chroot /newroot /init
+   (chroot, not pivot_root: the kernel forbids pivot_root from initramfs.
+    /overlay sits outside the chroot and is invisible from here on, so no
+    post-chroot cleanup of the raw disk path is needed)
+
+=== stage 2 (inside the merged rootfs, PEN_INIT_STAGE2=1) ===
+
+9.  Mount /workspace via virtio-fs
+10. Read injected env vars from /workspace/.pen-env → /run/pen-env → delete
+11. First-boot hook (Phase 2):
+    - Check if kernel cmdline has `pen.mode=build` → run build flow
+      (see Image build pipeline — Phase 3)
+    - Else check for /var/lib/pen/setup-done marker
+      - Absent AND setup script present in env → run it; on success
+        `mkdir -p /var/lib/pen && touch /var/lib/pen/setup-done`
+        (the file lands on the overlay's upper layer via normal copy-up)
+      - Present → skip
+12. /bin/sh -l                                    (as a child, NOT exec)
+13. sync && poweroff -f                           (on shell exit)
+    (poweroff, not exec-then-exit: letting PID 1 exit kernel-panics, and
+     Apple's Virtualization.framework does not surface that as a state
+     transition, so pen would hang forever on a dead console pipe)
 ```
 
 ### Where the setup script comes from
@@ -192,7 +204,7 @@ Custom images are built by booting a **builder VM** that uses the base pen image
   ```go
   type VMConfig struct {
       // ...existing fields...
-      Shares []Share         // replaces ShareDir/ShareTag (with back-compat shim if needed)
+      Shares []Share         // replaces ShareDir/ShareTag, no compat shim
       Disks  []Disk          // new: block devices
   }
   type Share struct { HostPath, Tag string; ReadOnly bool }
@@ -268,12 +280,11 @@ Goal: profile `packages` + `build` produce a cached custom initrd reused across 
 ## Testing strategy
 
 - **Unit tests** for profile parsing, hash computation, disk file creation, config merging.
-- **Integration tests** (macOS-only, same gate as existing `make test-integration`):
-  - Overlay persistence: install a package, reboot VM, verify presence.
-  - Profile setup idempotency: run setup, reboot, confirm marker prevents re-run.
-  - Image build determinism: same profile → same hash → cache hit.
-  - Builder VM smoke test: build a tiny profile with one package, verify the produced initrd is usable.
-- **Back-compat test:** existing `pen shell foo --dir .` (no profile, no disk flag) still works; the new init's overlay stage is a no-op when `/dev/vda` is absent.
+- **Integration tests** (macOS-only, `make test-integration`, local-only — GitHub hosted macOS runners are themselves Anka VMs and Apple VZ refuses nested virt; see `docs/ARCHITECTURE.md`):
+  - Overlay persistence: install a package, reboot VM, verify presence. *(Phase 1 — shipped as `internal/integration/TestOverlayPersistence`.)*
+  - Profile setup idempotency: run setup, reboot, confirm marker prevents re-run. *(Phase 2.)*
+  - Image build determinism: same profile → same hash → cache hit. *(Phase 3.)*
+  - Builder VM smoke test: build a tiny profile with one package, verify the produced initrd is usable. *(Phase 3.)*
 
 ## Non-goals (for this plan)
 
