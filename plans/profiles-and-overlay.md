@@ -208,7 +208,7 @@ Custom images are built by booting a **builder VM** that uses the base pen image
 - **Attachment:** wired into `VMConfig.Disks` as the sole (initially) block device, appears as `/dev/vda` in the guest.
 - **Sizing:** default 10G sparse; actual host footprint grows only as the guest writes to it. `--disk-size` on first `pen shell` overrides; ignored thereafter.
 - **Resize:** explicitly out of scope for v1. User can `pen delete` and recreate if they need more space.
-- **Back-compat:** if a VM has no `overlay.img` (e.g., created before this feature, or the user passed `--no-disk`), init skips the overlay stage and runs in the existing stateless mode. This keeps existing workflows working.
+- **Required, not optional:** the overlay disk is unconditionally attached and its ext4 mount + overlayfs is a hard prerequisite for shell startup. Any failure during stage 1 (no `/dev/vda`, mkfs failure, mount failure, network required for first-boot e2fsprogs install unavailable, etc.) prints an error and powers the VM off cleanly. There is no "ephemeral fallback" mode — pen has no users yet, so there is nothing to be backwards-compatible with.
 
 ## Implementation phases
 
@@ -224,13 +224,13 @@ Goal: `apk add` inside a `pen shell` session persists across reboots.
   - Wire `VirtioBlockDeviceConfiguration` + `DiskImageStorageDeviceAttachment` in `apple.go`.
   - Migrate the sole caller (`internal/commands/shell.go`) in the same PR — do not leave a compatibility shim.
 - **Base image additions to `images/alpine/build.sh`:**
-  - Add `e2fsprogs` to the apk package list so the guest has `mkfs.ext4` available on first boot. (Busybox has `mount`, `pivot_root`, `cpio`, `gzip` built in — no other additions needed.)
-- Create `overlay.img` lazily under `~/.config/pen/vms/<name>/` in `pen shell` if absent (sparse file via `os.Truncate`).
-- Update the guest init script to detect `/dev/vda`, mkfs if unformatted, set up overlayfs, pivot_root.
+  - Stop using `netboot/vmlinuz-virt` + `netboot/initramfs-virt`. The netboot files lag the main repo and the shipped `initramfs-virt` omits ext4, jbd2, mbcache, libcrc32c. Instead, resolve `linux-virt` from the main APKINDEX and download the full `linux-virt-<ver>.apk`, which ships a matched-version kernel *and* the full `/lib/modules/<kver>/` tree. Extract `boot/vmlinuz-virt` as the kernel and graft `lib/modules/` into the rootfs.
+  - e2fsprogs is lazy-installed via `apk add` on the very first boot of a fresh VM (there is no host-side `apk` on macOS, and Phase 3's builder VM replaces this altogether).
+- Create `overlay.img` lazily under `~/.config/pen/vms/<name>/` in `pen shell` (sparse file via `os.Truncate`).
+- Update the guest init script: modprobe `virtio_blk virtio_net virtiofs overlay ext4`, wait for eth0, run `udhcpc -s /usr/share/udhcpc/default.script` (the Alpine default script path), lazy-install e2fsprogs if needed, mkfs.ext4 the fresh disk, mount `-t ext4` explicitly (busybox `mount` autodetection returns EINVAL on unpartitioned whole-disk ext4), compose overlayfs, move mounts, chroot into stage 2, exec `/bin/sh -l`, then `poweroff -f` on shell exit (letting PID 1 exit would kernel-panic and Apple's Virtualization.framework does not surface that as a state transition).
 - Add `--disk-size` flag (first-boot only).
 - Update `pen delete` to remove `overlay.img`.
 - Test: `apk add vim`, exit, `pen shell`, verify `vim` still present.
-- Test: back-compat — when no `/dev/vda` is present the init falls through to the existing stateless path cleanly.
 
 ### Phase 2 — Profiles and first-boot setup hook
 

@@ -194,7 +194,14 @@ func (vm *appleVM) Start() error {
 		ch := vm.machine.StateChangedNotify()
 		for state := range ch {
 			if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
-				vm.once.Do(func() { close(vm.done) })
+				vm.once.Do(func() {
+					// Close the host read side of the console pipe so
+					// io.Copy in AttachConsole sees EOF and returns.
+					if vm.hostIn != nil {
+						vm.hostIn.Close()
+					}
+					close(vm.done)
+				})
 				return
 			}
 		}
