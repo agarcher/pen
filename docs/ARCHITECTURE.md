@@ -221,6 +221,8 @@ Runs on every push and PR to `main`:
 
 Uses `macos-latest` runner (required for CGo + Virtualization.framework headers).
 
+**`make test-integration` does not run in CI.** GitHub's hosted macOS runners are themselves Anka VMs, and Apple VZ refuses nested virtualization, so `vz.NewVirtualMachine` fails on every hosted runner. GitHub closed this as "not planned" in [actions/runner-images#13505](https://github.com/actions/runner-images/issues/13505). Integration tests must be run locally on a real Mac before merging.
+
 ### Release Workflow (`.github/workflows/release.yml`)
 
 Triggered by pushing a `v*` tag:

@@ -46,3 +46,7 @@ go test -v -run TestName ./internal/commands/
 ## Git Workflow
 
 Always use `gh pr merge --merge`. Never squash or rebase on merge.
+
+## Testing
+
+Run `make test-integration` before marking any task complete. CI can't run it (see ARCHITECTURE.md § CI/CD). Unit tests alone don't prove a boot-path change works.

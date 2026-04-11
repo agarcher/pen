@@ -1,6 +1,6 @@
 # Profiles, Custom Images, and Per-VM Overlay Disks
 
-**Status:** Ready to implement
+**Status:** Phase 1 complete (overlay disk plumbing). Phases 2–4 not started.
 **Scope:** Combines first-boot setup (#4), custom images (#1), and per-VM overlay disks (#2) into a single coherent feature.
 
 ## Goal
@@ -214,9 +214,11 @@ Custom images are built by booting a **builder VM** that uses the base pen image
 
 Each phase ships a usable, testable slice. Land one at a time.
 
-### Phase 1 — Overlay disk plumbing (no profiles yet)
+### Phase 1 — Overlay disk plumbing (no profiles yet) ✅ DONE
 
 Goal: `apk add` inside a `pen shell` session persists across reboots.
+
+Landed in commits `5fb2726`, `c679bec`, `001f3f1`. Verified end-to-end by `internal/integration/TestOverlayPersistence` (`make test-integration`): boot a fresh VM, `apk add vim`, `exit`, boot the same VM again, `which vim` still returns `/usr/bin/vim`. Ext4 journal replay confirmed clean on the second boot.
 
 - **Breaking `VMConfig` shape change** (internal only — `virt` is not a public package):
   - Replace `ShareDir`/`ShareTag` with `Shares []Share` (each with `HostPath`, `Tag`, `ReadOnly`).
@@ -290,6 +292,6 @@ The builder VM in Phase 3 needs two simultaneous virtio-fs shares (`control` rea
 
 **Action:** as the **first task of Phase 3**, write a throwaway smoke test that boots a minimal VM with two shares and verifies both are mounted inside the guest. Do this *before* building the rest of the builder pipeline — if it doesn't work, the entire image-build approach needs rethinking and it's better to discover that early.
 
-### 2. Disk-not-clean recovery
+### 2. Disk-not-clean recovery ✅ resolved
 
-If a VM crashes mid-write (e.g., host `kill -9` the pen process), ext4 journal replay on next boot should handle it. Validate in Phase 1 by forcibly killing pen during heavy writes and confirming the next boot is clean — if journal replay doesn't happen automatically under the busybox init, we may need an explicit `e2fsck -p /dev/vda` step before mounting.
+Confirmed during Phase 1 smoke testing: after an unclean shutdown (kernel panic on an earlier buggy build that left the ext4 dirty), the next boot logged `EXT4-fs (vda): recovery complete` and mounted successfully with no `e2fsck` step required. Journal replay works out of the box under busybox mount; no guard needed.
