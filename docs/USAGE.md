@@ -105,7 +105,7 @@ pen stop <name>
 
 **Behavior:**
 
-- Looks up the PID from `~/.config/pen/vms/<name>/pid`
+- Reads the PID from `~/.config/pen/vms/<name>/lock`
 - Sends SIGTERM to the `pen shell` process
 - The process handles the signal, stops the VM, and cleans up
 
@@ -254,7 +254,7 @@ pen profile list
 
 **Example output:**
 
-```
+```text
 NAME     PACKAGES  SETUP
 claude   4         yes
 minimal  0         no
@@ -300,7 +300,7 @@ pen image list
 
 **Example output:**
 
-```
+```text
 NAME     TYPE     SIZE    AGE
 vmlinuz  base     14.2M   5d ago
 initrd   base     28.7M   5d ago
@@ -358,7 +358,7 @@ Per-VM state is stored in `~/.config/pen/vms/<name>/`:
 
 ```
 ~/.config/pen/vms/dev/
-├── vm.json      # VM configuration (name, dir, cpus, memory, profile, created_at)
+├── vm.json      # VM configuration (name, dir, cpus, memory, profile, setup_hash, created_at)
 ├── lock         # flock-based liveness (PID written inside)
 └── overlay.img  # ext4 sparse file, persistent overlay disk
 ```

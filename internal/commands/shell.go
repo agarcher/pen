@@ -133,6 +133,13 @@ func runShell(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(cmd.ErrOrStderr(), "pen: profile setup script changed; existing VMs will not re-run it (delete and recreate to apply)")
 	}
 
+	// Preserve the original setup hash for existing VMs so the warning
+	// remains relative to VM creation time, not the last boot.
+	persistedSetupHash := setupHash
+	if prior != nil && prior.SetupHash != "" {
+		persistedSetupHash = prior.SetupHash
+	}
+
 	// Persist VM state. Preserve CreatedAt for existing VMs.
 	createdAt := time.Now()
 	if prior != nil {
@@ -144,7 +151,7 @@ func runShell(cmd *cobra.Command, args []string) error {
 		CPUs:      shellCPUs,
 		MemoryMB:  shellMem,
 		Profile:   effectiveProfile,
-		SetupHash: setupHash,
+		SetupHash: persistedSetupHash,
 		CreatedAt: createdAt,
 	}
 	if err := vm.Save(state); err != nil {
