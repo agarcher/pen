@@ -118,11 +118,13 @@ func Build(hyp virt.Hypervisor, profileName string, packages []string, buildScri
 		close(done)
 	}()
 
-	// Wait for the builder VM to halt.
-	if err := v.Wait(); err != nil {
-		return fmt.Errorf("builder VM failed: %w", err)
-	}
+	// Wait for the builder VM to halt, then drain the console stream
+	// so the full build log is available before we check for errors.
+	waitErr := v.Wait()
 	<-done
+	if waitErr != nil {
+		return fmt.Errorf("builder VM failed: %w", waitErr)
+	}
 
 	// Verify the output initrd was produced.
 	outputInitrd := filepath.Join(outputDir, "initrd")
@@ -134,15 +136,26 @@ func Build(hyp virt.Hypervisor, profileName string, packages []string, buildScri
 		return fmt.Errorf("build failed: output initrd is empty (check build log above)")
 	}
 
-	// Move to the profile image cache (dir already created for the lock).
+	// Publish the new initrd atomically: invalidate the old hash first
+	// so concurrent readers can't accept a stale hash with a new initrd,
+	// then copy to a temp file and rename into place.
 	destInitrd := filepath.Join(profileDir, initrdFile)
-	// Copy rather than rename — tmp and profile dir may be on different filesystems.
-	if err := copyFile(outputInitrd, destInitrd); err != nil {
-		return fmt.Errorf("storing built initrd: %w", err)
+	tmpInitrd := destInitrd + ".tmp"
+	hashPath := filepath.Join(profileDir, hashFile)
+
+	if err := os.Remove(hashPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clearing stale build hash: %w", err)
+	}
+	if err := copyFile(outputInitrd, tmpInitrd); err != nil {
+		return fmt.Errorf("staging built initrd: %w", err)
+	}
+	if err := os.Rename(tmpInitrd, destInitrd); err != nil {
+		os.Remove(tmpInitrd)
+		return fmt.Errorf("publishing built initrd: %w", err)
 	}
 
-	// Write the hash file.
-	if err := os.WriteFile(filepath.Join(profileDir, hashFile), []byte(expectedHash+"\n"), 0644); err != nil {
+	// Write the hash file last — only after the initrd is in place.
+	if err := os.WriteFile(hashPath, []byte(expectedHash+"\n"), 0644); err != nil {
 		return fmt.Errorf("writing build hash: %w", err)
 	}
 
