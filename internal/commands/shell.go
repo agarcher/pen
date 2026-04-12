@@ -93,9 +93,11 @@ func runShell(cmd *cobra.Command, args []string) error {
 	// been shaped by whatever setup ran (or didn't) the first time.
 	// Delete and recreate is the escape hatch.
 	var prof *profile.Profile
+	var prior *vm.VMState
 	effectiveProfile := shellProfile
 	if vm.Exists(name) {
-		prior, err := vm.Load(name)
+		var err error
+		prior, err = vm.Load(name)
 		if err != nil {
 			return fmt.Errorf("loading existing VM state: %w", err)
 		}
@@ -119,14 +121,18 @@ func runShell(cmd *cobra.Command, args []string) error {
 		prof = p
 	}
 
-	// Persist VM state.
+	// Persist VM state. Preserve CreatedAt for existing VMs.
+	createdAt := time.Now()
+	if prior != nil {
+		createdAt = prior.CreatedAt
+	}
 	state := &vm.VMState{
 		Name:      name,
 		Dir:       dir,
 		CPUs:      shellCPUs,
 		MemoryMB:  shellMem,
 		Profile:   effectiveProfile,
-		CreatedAt: time.Now(),
+		CreatedAt: createdAt,
 	}
 	if err := vm.Save(state); err != nil {
 		return fmt.Errorf("saving VM state: %w", err)

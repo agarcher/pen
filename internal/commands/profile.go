@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
 
@@ -111,7 +112,7 @@ var profileShowCmd = &cobra.Command{
 
 // printBlock renders a multi-line script indented by two spaces, or
 // "(none)" if the block is empty after trimming whitespace.
-func printBlock(w interface{ Write([]byte) (int, error) }, s string) {
+func printBlock(w io.Writer, s string) {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		fmt.Fprintln(w, "  (none)")
