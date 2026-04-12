@@ -27,6 +27,7 @@ type VMState struct {
 	CPUs      uint      `json:"cpus"`
 	MemoryMB  uint64    `json:"memory_mb"`
 	Profile   string    `json:"profile,omitempty"`
+	SetupHash string    `json:"setup_hash,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

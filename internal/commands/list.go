@@ -28,10 +28,14 @@ var listCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSTATUS\tCPUS\tMEMORY\tDIR")
+		fmt.Fprintln(w, "NAME\tPROFILE\tSTATUS\tCPUS\tMEMORY\tDIR")
 		for _, v := range vms {
-			fmt.Fprintf(w, "%s\t%s\t%d\t%dMB\t%s\n",
-				v.Name, v.Status, v.CPUs, v.MemoryMB, v.Dir)
+			prof := v.Profile
+			if prof == "" {
+				prof = "-"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%dMB\t%s\n",
+				v.Name, prof, v.Status, v.CPUs, v.MemoryMB, v.Dir)
 		}
 		return w.Flush()
 	},

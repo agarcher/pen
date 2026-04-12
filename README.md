@@ -54,14 +54,46 @@ exit
 
 On first run, `pen` automatically downloads a minimal Alpine Linux image (~15MB kernel + initrd).
 
+## Profiles & Custom Images
+
+Profiles let you declare packages, build scripts, and first-boot setup in a TOML file. Stable tools are baked into an immutable custom image (built once per profile); per-VM state lives on a persistent overlay disk.
+
+```bash
+# Create a profile
+cat > ~/.config/pen/profiles/claude.toml <<'EOF'
+packages = ["nodejs", "npm", "git", "ripgrep"]
+
+build = """
+npm install -g @anthropic-ai/claude-code
+rm -rf /var/cache/apk/*
+"""
+
+setup = """
+mkdir -p /root/.claude
+"""
+EOF
+
+# Build the custom image (or let pen shell do it automatically)
+pen image build claude
+
+# Boot a VM with the profile
+pen shell agent --profile claude --dir .
+```
+
+See the [Usage Guide](docs/USAGE.md#profiles--custom-images) for details.
+
 ## Commands
 
 | Command | Description | Details |
 |---------|-------------|---------|
 | `pen shell <name>` | Create, start, and attach to a VM | [docs](docs/USAGE.md#pen-shell) |
-| `pen list` | List all VMs with status | [docs](docs/USAGE.md#pen-list) |
+| `pen list` | List all VMs with status and profile | [docs](docs/USAGE.md#pen-list) |
 | `pen stop <name>` | Stop a running VM | [docs](docs/USAGE.md#pen-stop) |
 | `pen delete <name>` | Delete a VM and its state | [docs](docs/USAGE.md#pen-delete) |
+| `pen profile list` | List available profiles | [docs](docs/USAGE.md#pen-profile-list) |
+| `pen profile show <name>` | Show a profile's configuration | [docs](docs/USAGE.md#pen-profile-show) |
+| `pen image build <profile>` | Build a custom image for a profile | [docs](docs/USAGE.md#pen-image-build) |
+| `pen image list` | List built images with sizes | [docs](docs/USAGE.md#pen-image-list) |
 | `pen version` | Print version number | [docs](docs/USAGE.md#pen-version) |
 
 See the [Usage Guide](docs/USAGE.md) for detailed command documentation.
