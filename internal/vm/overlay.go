@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const overlayFile = "overlay.img"
@@ -55,6 +56,25 @@ func EnsureOverlay(name string, sizeBytes int64) (string, error) {
 		return "", fmt.Errorf("closing overlay disk: %w", err)
 	}
 	return path, nil
+}
+
+// OverlayDiskUsage returns the actual bytes on disk for a VM's overlay image.
+// For sparse files, this reflects only the allocated blocks, not the logical
+// size. Returns 0 if the overlay file does not exist.
+func OverlayDiskUsage(name string) (int64, error) {
+	path, err := OverlayPath(name)
+	if err != nil {
+		return 0, err
+	}
+
+	var stat syscall.Stat_t
+	if err := syscall.Stat(path, &stat); err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("stat overlay disk: %w", err)
+	}
+	return stat.Blocks * 512, nil
 }
 
 // ParseDiskSize parses a human-readable size string like "10G", "512M",

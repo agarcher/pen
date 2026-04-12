@@ -15,35 +15,53 @@ This document describes the internal architecture of `pen` for developers who wa
 │  │  ┌────────────┐  ┌────────────┐  ┌───────────────────┐  │   │
 │  │  │  Commands   │  │   Image    │  │   Env Injection   │  │   │
 │  │  │  - shell    │  │  - resolve │  │  - write .pen-env │  │   │
-│  │  │  - list     │  │  - download│  │  - cleanup        │  │   │
-│  │  │  - stop     │  │  - cache   │  │                   │  │   │
-│  │  │  - delete   │  │            │  │                   │  │   │
+│  │  │  - list     │  │  - download│  │  - write .pen-    │  │   │
+│  │  │  - stop     │  │  - build   │  │    setup          │  │   │
+│  │  │  - delete   │  │  - hash    │  │  - cleanup        │  │   │
+│  │  │  - profile  │  │  - cache   │  │                   │  │   │
+│  │  │  - image    │  │            │  │                   │  │   │
 │  │  └────────────┘  └────────────┘  └───────────────────┘  │   │
-│  │  ┌────────────┐  ┌──────────────────────────────────┐   │   │
-│  │  │  VM State   │  │  Virtualization (vz/v3 → ObjC)  │   │   │
-│  │  │  - save     │  │  - Linux boot loader            │   │   │
-│  │  │  - load     │  │  - virtio console (hvc0)        │   │   │
-│  │  │  - PID      │  │  - virtio-fs (workspace)        │   │   │
-│  │  │  - list     │  │  - virtio-net (NAT)             │   │   │
-│  │  └────────────┘  │  - virtio-entropy                │   │   │
-│  │                   └──────────────────────────────────┘   │   │
+│  │  ┌────────────┐  ┌────────────┐                         │   │
+│  │  │  VM State   │  │  Profile   │                        │   │
+│  │  │  - save     │  │  - parse   │                        │   │
+│  │  │  - load     │  │  - validate│                        │   │
+│  │  │  - lock     │  │  - list    │                        │   │
+│  │  │  - overlay  │  │            │                        │   │
+│  │  └────────────┘  └────────────┘                         │   │
+│  │  ┌──────────────────────────────────────────────────┐   │   │
+│  │  │         Virtualization (vz/v3 → ObjC)            │   │   │
+│  │  │  - Linux boot loader                             │   │   │
+│  │  │  - virtio console (hvc0)                         │   │   │
+│  │  │  - virtio-fs (workspace + build shares)          │   │   │
+│  │  │  - virtio-blk (overlay disk)                     │   │   │
+│  │  │  - virtio-net (NAT)                              │   │   │
+│  │  │  - virtio-entropy                                │   │   │
+│  │  └──────────────────────────────────────────────────┘   │   │
 │  └──────────────────────────────────────────────────────────┘   │
-│            │ stdin/stdout (pipes)         │ virtio-fs           │
-│            │                              │                     │
-├────────────┼──────────────────────────────┼─────────────────────┤
-│            ▼                              ▼                     │
+│            │ stdin/stdout (pipes)    │ virtio-fs  │ virtio-blk  │
+│            │                        │            │              │
+├────────────┼────────────────────────┼────────────┼──────────────┤
+│            ▼                        ▼            ▼              │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │                   Guest (Alpine Linux)                    │   │
 │  │                                                           │   │
-│  │  /init (PID 1)                                           │   │
+│  │  /init (PID 1) — stage 1 (bare initramfs)               │   │
 │  │    ├── mount proc, sys, devtmpfs, tmpfs, devpts          │   │
+│  │    ├── modprobe virtio_blk, virtiofs, overlay, ext4      │   │
 │  │    ├── ip link set eth0 up → udhcpc                      │   │
+│  │    ├── mount -t ext4 /dev/vda /overlay                   │   │
+│  │    ├── mount -t overlay (lower=/, upper=/overlay/upper)  │   │
+│  │    └── chroot /newroot /init (stage 2)                   │   │
+│  │                                                           │   │
+│  │  /init — stage 2 (merged rootfs, overlayfs active)       │   │
 │  │    ├── mount -t virtiofs workspace /workspace             │   │
 │  │    ├── read .pen-env → /run/pen-env → delete original    │   │
-│  │    └── exec /bin/sh -l  (on hvc0)                        │   │
+│  │    ├── first-boot setup (if marker absent)               │   │
+│  │    ├── /bin/sh -l  (on hvc0)                             │   │
+│  │    └── sync && poweroff -f                               │   │
 │  │                                                           │   │
 │  │  /workspace ← virtio-fs shared directory (read-write)    │   │
-│  │  /run/pen-env ← injected env vars (tmpfs, ephemeral)     │   │
+│  │  /           ← overlayfs (initramfs + overlay disk)      │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -59,17 +77,24 @@ pen/
 │   │   ├── shell.go         #   pen shell — boot + attach
 │   │   ├── list.go          #   pen list — tabular VM listing
 │   │   ├── stop.go          #   pen stop — SIGTERM to owner
-│   │   └── delete.go        #   pen delete — remove state
+│   │   ├── delete.go        #   pen delete — remove state
+│   │   ├── profile.go       #   pen profile list/show
+│   │   └── image.go         #   pen image build/list
 │   ├── virt/                 # Hypervisor abstraction
 │   │   ├── virt.go          #   VM and Hypervisor interfaces
 │   │   └── apple.go         #   Apple Virtualization.framework impl
 │   ├── vm/                   # VM lifecycle and state
-│   │   ├── state.go         #   Save/load/list/delete, PID tracking
+│   │   ├── state.go         #   Save/load/list/delete, flock-based liveness
+│   │   ├── overlay.go       #   Overlay disk creation and management
 │   │   └── console.go       #   Raw terminal attachment
 │   ├── image/                # VM image management
-│   │   └── image.go         #   Resolve, download, cache
-│   └── envject/              # Environment variable injection
-│       └── inject.go        #   Write/cleanup .pen-env dotfile
+│   │   ├── image.go         #   Resolve, download, cache
+│   │   ├── build.go         #   Profile image building via builder VM
+│   │   └── hash.go          #   Content-addressable image cache keys
+│   ├── profile/              # Profile parsing and validation
+│   │   └── profile.go       #   TOML loading, listing, validation
+│   └── envject/              # Environment and setup injection
+│       └── inject.go        #   Write/cleanup .pen-env and .pen-setup
 ├── images/alpine/            # Image build tooling
 │   └── build.sh             #   Downloads Alpine + builds initramfs
 ├── entitlements/             # macOS code signing
@@ -131,14 +156,30 @@ Env vars are passed through the shared directory rather than vsock (the Alpine `
 
 Values are single-quote escaped to prevent shell injection.
 
-### PID-Based Liveness
+### Lock-Based Liveness
 
-VMs run in-process (the `pen shell` command blocks while the VM is active). Liveness is tracked via PID files:
+VMs run in-process (the `pen shell` command blocks while the VM is active). Liveness is tracked via `flock(2)` on a lock file:
 
-- `pen shell` writes `os.Getpid()` to `~/.config/pen/vms/<name>/pid`
-- `pen list` checks each PID with `signal(0)` — alive means running, dead means stopped
-- `pen stop` sends `SIGTERM` to the recorded PID
-- Stale PID files from crashed processes are auto-cleaned on `pen list`
+- `pen shell` acquires an exclusive non-blocking flock on `~/.config/pen/vms/<name>/lock` and writes its PID
+- `pen list` checks liveness by attempting to acquire the same lock — success means the VM is stopped
+- `pen stop` reads the PID from the lock file and sends `SIGTERM`
+- The OS releases flock locks automatically on process exit, even after a crash — no stale PID cleanup needed
+
+### Overlay Disk & Overlayfs
+
+Each VM has a persistent ext4 overlay disk at `~/.config/pen/vms/<name>/overlay.img`:
+
+- **Host:** creates a sparse file via `os.Truncate` (default 10G; actual footprint grows only as the guest writes)
+- **Guest init (stage 1):** formats the disk on first boot (`mkfs.ext4 /dev/vda`), mounts it, composes overlayfs over the initramfs rootfs, then chroots into the merged view
+- **Result:** `/` appears writable; all mutations land on the overlay disk and persist across reboots
+- `/workspace` bypasses the overlay — it remains a direct virtio-fs host share
+
+### Profile-Driven Images
+
+Profiles declare two layers of customization:
+
+1. **Custom image** (`packages` + `build`): stable tools baked into an immutable initrd, shared across all VMs using the profile. Built by a temporary builder VM that installs packages, runs the build script, and repacks the rootfs via `cpio | gzip`. Cache key = sha256(sorted packages + build script + base initrd).
+2. **First-boot setup** (`setup`): per-VM initialization run once against the overlay disk (gated by a marker at `/var/lib/pen/setup-done`). Changes to `setup` do not affect existing VMs.
 
 ### Image Auto-Download
 
@@ -202,12 +243,11 @@ The plan originally called for vsock-based injection, but the Alpine `linux-virt
 - Works with the same virtio-fs mount already configured for workspace sharing
 - Brief disk exposure (milliseconds between write and guest deletion) is acceptable for the threat model (the shared directory is already trusted)
 
-### Why PID Files Instead of a Daemon?
+### Why flock Instead of a Daemon?
 
 - No background process to manage or crash
 - Each `pen shell` is a self-contained process
-- PID liveness check via `signal(0)` is simple and reliable
-- Stale PIDs from crashes are detected and cleaned up automatically
+- `flock(2)` is released automatically on process exit (even crashes) — no stale-PID problem
 - Tradeoff: no out-of-band VM management (can't detach/reattach). This matches the intended workflow where the agent owns the terminal.
 
 ## CI/CD

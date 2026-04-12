@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -121,6 +123,23 @@ func runShell(cmd *cobra.Command, args []string) error {
 		prof = p
 	}
 
+	// Compute the setup hash so we can detect profile setup changes.
+	var setupHash string
+	if prof != nil {
+		h := sha256.Sum256([]byte(prof.Setup))
+		setupHash = hex.EncodeToString(h[:])
+	}
+	if prior != nil && prior.SetupHash != "" && setupHash != "" && prior.SetupHash != setupHash {
+		fmt.Fprintln(cmd.ErrOrStderr(), "pen: profile setup script changed; existing VMs will not re-run it (delete and recreate to apply)")
+	}
+
+	// Preserve the original setup hash for existing VMs so the warning
+	// remains relative to VM creation time, not the last boot.
+	persistedSetupHash := setupHash
+	if prior != nil && prior.SetupHash != "" {
+		persistedSetupHash = prior.SetupHash
+	}
+
 	// Persist VM state. Preserve CreatedAt for existing VMs.
 	createdAt := time.Now()
 	if prior != nil {
@@ -132,6 +151,7 @@ func runShell(cmd *cobra.Command, args []string) error {
 		CPUs:      shellCPUs,
 		MemoryMB:  shellMem,
 		Profile:   effectiveProfile,
+		SetupHash: persistedSetupHash,
 		CreatedAt: createdAt,
 	}
 	if err := vm.Save(state); err != nil {

@@ -27,16 +27,20 @@ pen shell <name> [flags]
 | `--memory <mb>` | `2048` | Memory in megabytes |
 | `--env KEY=VALUE` | | Set an environment variable in the guest (repeatable) |
 | `--env-from-host KEY` | | Pass an env var from the host environment (repeatable) |
+| `--profile <name>` | | Use a named profile from `~/.config/pen/profiles/<name>.toml` |
+| `--disk-size <size>` | `10G` | Overlay disk size (first boot only; ignored thereafter) |
 
 **Behavior:**
 
-- Refuses to start if a VM with the same name is already running (PID-based check)
+- Refuses to start if a VM with the same name is already running (lock-based check)
 - Saves VM state to `~/.config/pen/vms/<name>/vm.json`
-- Writes a PID file for liveness detection by `pen list` and `pen stop`
+- Acquires an exclusive lock for liveness detection by `pen list` and `pen stop`
 - On first run, downloads Alpine Linux kernel + initrd if not cached locally
+- Creates a persistent overlay disk (`overlay.img`) on first boot; all filesystem changes persist across reboots
+- If `--profile` is specified, builds the profile's custom image if stale or missing
 - Mounts the host directory at `/workspace` in the guest via virtio-fs (read-write)
 - Attaches the terminal in raw mode to the guest console (hvc0)
-- Cleans up PID file on exit
+- Cleans up on exit
 
 **Guest environment:**
 
@@ -77,17 +81,17 @@ pen list
 **Example output:**
 
 ```
-NAME     STATUS   CPUS  MEMORY  DIR
-dev      running  12    2048MB  /Users/me/src/project
-agent    stopped  4     4096MB  /Users/me/src/other
+NAME     PROFILE  STATUS   CPUS  MEMORY  DIR
+dev      claude   running  12    2048MB  /Users/me/src/project
+agent    -        stopped  4     4096MB  /Users/me/src/other
 ```
 
 **Status values:**
 
 | Status | Meaning |
 |--------|---------|
-| `running` | The owning `pen shell` process is alive (verified via signal 0) |
-| `stopped` | No live process found; stale PID files are auto-cleaned |
+| `running` | The owning `pen shell` process holds the lock |
+| `stopped` | No live process holds the lock |
 
 ---
 
@@ -101,7 +105,7 @@ pen stop <name>
 
 **Behavior:**
 
-- Looks up the PID from `~/.config/pen/vms/<name>/pid`
+- Reads the PID from `~/.config/pen/vms/<name>/lock`
 - Sends SIGTERM to the `pen shell` process
 - The process handles the signal, stops the VM, and cleans up
 
@@ -127,12 +131,14 @@ pen delete <name>
 **Behavior:**
 
 - Refuses to delete a running VM (stop it first)
-- Removes the `~/.config/pen/vms/<name>/` directory
+- Warns if the overlay disk has non-trivial data (>100MB actual usage)
+- Removes the `~/.config/pen/vms/<name>/` directory including the overlay disk
 
 **Example:**
 
 ```bash
 pen delete dev
+# pen: overlay disk for "dev" has ~245MB of data (will be permanently deleted)
 # pen: deleted dev
 ```
 
@@ -194,6 +200,115 @@ echo $ANTHROPIC_API_KEY
 
 ---
 
+## Profiles & Custom Images
+
+A profile is a TOML file at `~/.config/pen/profiles/<name>.toml` that declares two layers of customization:
+
+| Layer | Mutability | Scope | What lives here |
+|---|---|---|---|
+| **Custom image** (initrd per profile) | Immutable, content-addressed | Shared across all VMs using the profile | apk packages, binaries, language runtimes |
+| **Overlay disk** (overlay.img per VM) | Read/write, persistent | One VM | node_modules, caches, runtime installs, project state |
+
+### Profile config
+
+```toml
+# ~/.config/pen/profiles/claude.toml
+
+# Packages baked into the custom image.
+packages = ["nodejs", "npm", "git", "ripgrep"]
+
+# Commands run at image-build time (baked into the image).
+build = """
+npm install -g @anthropic-ai/claude-code
+rm -rf /var/cache/apk/*
+"""
+
+# Commands run on first boot of a fresh VM (on the overlay disk).
+# Runs exactly once; ignored for existing VMs if this section changes.
+setup = """
+mkdir -p /root/.claude
+"""
+
+# Overlay disk config (optional).
+[disk]
+size = "10G"     # default
+```
+
+### Cache invalidation
+
+- Image cache key = sha256 of `packages` + `build` + base initrd content.
+- `setup` and `disk` do **not** affect the image cache.
+- Stale images are rebuilt automatically on `pen shell --profile`.
+
+---
+
+### pen profile list
+
+List available profiles.
+
+```bash
+pen profile list
+```
+
+**Aliases:** `ls`
+
+**Example output:**
+
+```text
+NAME     PACKAGES  SETUP
+claude   4         yes
+minimal  0         no
+```
+
+---
+
+### pen profile show
+
+Show a profile's configuration and image build status.
+
+```bash
+pen profile show <name>
+```
+
+**Example:**
+
+```bash
+pen profile show claude
+```
+
+---
+
+### pen image build
+
+Build (or rebuild) a custom image for a profile.
+
+```bash
+pen image build <profile>
+```
+
+Boots a builder VM that installs packages, runs the build script, and repacks the rootfs into a cached initrd. Build progress streams to stderr.
+
+---
+
+### pen image list
+
+List all built images (base and profile) with sizes and ages.
+
+```bash
+pen image list
+```
+
+**Example output:**
+
+```text
+NAME     TYPE     SIZE    AGE
+vmlinuz  base     14.2M   5d ago
+initrd   base     28.7M   5d ago
+claude   profile  95.3M   2h ago
+```
+
+---
+
 ## VM Images
 
 ### Local Cache
@@ -202,8 +317,12 @@ Images are stored in `~/.config/pen/images/`:
 
 ```
 ~/.config/pen/images/
-├── vmlinuz    # Alpine linux-virt kernel
-└── initrd     # Compressed initramfs with Alpine minirootfs + init script
+├── vmlinuz                    # Alpine linux-virt kernel (shared by all images)
+├── initrd                     # Base initramfs
+└── profiles/
+    └── <profile-name>/
+        ├── initrd             # Custom initrd built from profile
+        └── build.hash         # sha256 of image-affecting profile fields
 ```
 
 ### Auto-Download
@@ -239,8 +358,9 @@ Per-VM state is stored in `~/.config/pen/vms/<name>/`:
 
 ```
 ~/.config/pen/vms/dev/
-├── vm.json    # VM configuration (name, dir, cpus, memory, created_at)
-└── pid        # PID of the owning pen shell process (present when running)
+├── vm.json      # VM configuration (name, dir, cpus, memory, profile, setup_hash, created_at)
+├── lock         # flock-based liveness (PID written inside)
+└── overlay.img  # ext4 sparse file, persistent overlay disk
 ```
 
-Liveness is checked by sending signal 0 to the recorded PID. Stale PID files (from crashed processes) are automatically cleaned up when `pen list` runs.
+Liveness is checked via non-blocking `flock(2)` on the lock file. The OS releases the lock automatically on process exit, making this reliable even after crashes.
