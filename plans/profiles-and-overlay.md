@@ -1,6 +1,6 @@
 # Profiles, Custom Images, and Per-VM Overlay Disks
 
-**Status:** Phase 1 complete (overlay disk plumbing). Phases 2–4 not started.
+**Status:** Phases 1–3 complete. Phase 4 (polish) not started.
 **Scope:** Combines first-boot setup (#4), custom images (#1), and per-VM overlay disks (#2) into a single coherent feature.
 
 ## Goal
@@ -246,9 +246,11 @@ Landed in commits `5fb2726`, `c679bec`, `001f3f1`. Verified end-to-end by `inter
 - Update `pen delete` to remove `overlay.img`.
 - Test: `apk add vim`, exit, `pen shell`, verify `vim` still present.
 
-### Phase 2 — Profiles and first-boot setup hook
+### Phase 2 — Profiles and first-boot setup hook ✅ DONE
 
 Goal: a profile's `setup` script runs exactly once per fresh VM.
+
+Landed in PR #4 (commits `fa24687`, `7dfe72c`). Verified end-to-end by `internal/integration/TestProfileSetupIdempotency` (`make test-integration`): first boot runs setup, second boot skips it (marker prevents re-run), editing the profile doesn't re-trigger on existing VMs.
 
 - Add `internal/profile` package: TOML parsing, `~/.config/pen/profiles/` loading.
 - Add `--profile` flag to `pen shell`. Profile name persisted in `vm.json`.
@@ -257,9 +259,11 @@ Goal: a profile's `setup` script runs exactly once per fresh VM.
 - Add `pen profile list` and `pen profile show`.
 - Test: first `pen shell --profile foo bar` runs setup; second run doesn't; editing the profile doesn't re-trigger.
 
-### Phase 3 — Custom image builds
+### Phase 3 — Custom image builds ✅ DONE
 
 Goal: profile `packages` + `build` produce a cached custom initrd reused across VMs.
+
+Verified end-to-end by `internal/integration/TestImageBuildProducesUsableInitrd` and `internal/integration/TestImageCacheInvalidation` (`make test-integration`): builder VM installs packages and repacks rootfs into a cached initrd; `pen shell --profile` uses it automatically; hash-based cache invalidation works correctly (package changes trigger rebuild, setup changes don't).
 
 - Add `internal/image/build.go`: hash computation, cache lookup, builder VM orchestration.
 - Extend guest init with `pen.mode=build` branch: reads `/control/packages` + `/control/build.sh`, runs them, repacks rootfs to `/output/initrd`, halts.

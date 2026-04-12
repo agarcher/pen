@@ -1,10 +1,8 @@
 // Package profile loads and validates pen VM profiles from
 // ~/.config/pen/profiles/<name>.toml.
 //
-// A profile describes how to build a custom image (Phase 3) and what to
-// run on the first boot of a fresh VM (Phase 2). In Phase 2 only the
-// Setup field is honored at runtime; Packages, Build, and Disk are
-// parsed and validated but otherwise ignored.
+// A profile describes how to build a custom image (packages + build)
+// and what to run on the first boot of a fresh VM (setup).
 package profile
 
 import (
@@ -40,16 +38,22 @@ var packageRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]*$`)
 // filename and is not a TOML field.
 type Profile struct {
 	Name     string   `toml:"-"`
-	Packages []string `toml:"packages"` // DEFERRED — Phase 3
-	Build    string   `toml:"build"`    // DEFERRED — Phase 3
+	Packages []string `toml:"packages"`
+	Build    string   `toml:"build"`
 	Setup    string   `toml:"setup"`
-	Disk     Disk     `toml:"disk"` // DEFERRED — Phase 3
+	Disk     Disk     `toml:"disk"`
 }
 
-// Disk describes the overlay-disk options for a profile. Phase 3 will
-// honor Size; Phase 2 only validates it.
+// Disk describes the overlay-disk options for a profile.
 type Disk struct {
 	Size string `toml:"size"`
+}
+
+// NeedsImageBuild reports whether this profile requires a custom image
+// build. A profile needs a build if it declares packages to install or
+// a build script to run.
+func (p *Profile) NeedsImageBuild() bool {
+	return len(p.Packages) > 0 || strings.TrimSpace(p.Build) != ""
 }
 
 // Dir returns the absolute path to ~/.config/pen/profiles.

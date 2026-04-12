@@ -6,6 +6,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/agarcher/pen/internal/image"
 	"github.com/agarcher/pen/internal/profile"
 	"github.com/spf13/cobra"
 )
@@ -20,8 +21,8 @@ var profileCmd = &cobra.Command{
 	Use:   "profile",
 	Short: "Manage VM profiles",
 	Long: `A profile is a TOML file in ~/.config/pen/profiles/<name>.toml that
-describes what to run on the first boot of a fresh VM (setup) and what
-to bake into a custom image (packages, build — Phase 3).`,
+describes what to bake into a custom image (packages, build) and what
+to run on the first boot of a fresh VM (setup).`,
 }
 
 var profileListCmd = &cobra.Command{
@@ -87,7 +88,7 @@ var profileShowCmd = &cobra.Command{
 		printBlock(out, p.Setup)
 		fmt.Fprintln(out)
 
-		fmt.Fprintln(out, "Packages (DEFERRED — Phase 3):")
+		fmt.Fprintln(out, "Packages:")
 		if len(p.Packages) == 0 {
 			fmt.Fprintln(out, "  (none)")
 		} else {
@@ -97,7 +98,7 @@ var profileShowCmd = &cobra.Command{
 		}
 		fmt.Fprintln(out)
 
-		fmt.Fprintln(out, "Build script (DEFERRED — Phase 3):")
+		fmt.Fprintln(out, "Build script:")
 		printBlock(out, p.Build)
 		fmt.Fprintln(out)
 
@@ -105,7 +106,32 @@ var profileShowCmd = &cobra.Command{
 		if diskSize == "" {
 			diskSize = "(default)"
 		}
-		fmt.Fprintf(out, "Disk size (DEFERRED — Phase 3): %s\n", diskSize)
+		fmt.Fprintf(out, "Disk size: %s\n", diskSize)
+		fmt.Fprintln(out)
+
+		// Image build status.
+		if !p.NeedsImageBuild() {
+			fmt.Fprintln(out, "Image: not needed (no packages or build script)")
+		} else {
+			basePaths, err := image.Resolve()
+			if err != nil {
+				fmt.Fprintf(out, "Image: unknown (cannot resolve base image: %v)\n", err)
+			} else {
+				hash, err := image.ProfileImageHash(p.Packages, p.Build, basePaths.Initrd)
+				if err != nil {
+					fmt.Fprintf(out, "Image: unknown (hash error: %v)\n", err)
+				} else {
+					fresh, err := image.IsImageFresh(name, hash)
+					if err != nil {
+						fmt.Fprintf(out, "Image: unknown (freshness check error: %v)\n", err)
+					} else if fresh {
+						fmt.Fprintf(out, "Image: up to date (hash %s)\n", hash[:12])
+					} else {
+						fmt.Fprintln(out, "Image: stale or not built (run: pen image build "+name+")")
+					}
+				}
+			}
+		}
 		return nil
 	},
 }
