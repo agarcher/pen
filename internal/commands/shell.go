@@ -148,6 +148,8 @@ func runShell(cmd *cobra.Command, args []string) error {
 	defer lock.Release()
 
 	// Write env file to shared dir before boot so guest init can read it.
+	// O_EXCL ensures two concurrent pen shells on the same workspace
+	// directory fail rather than silently clobbering each other's files.
 	if !spec.IsEmpty() {
 		if err := envject.WriteEnvFile(dir, spec); err != nil {
 			return fmt.Errorf("writing env file: %w", err)

@@ -13,51 +13,69 @@ import (
 	"time"
 )
 
-// bootTimeout bounds a single `pen shell` invocation. On a fresh VM the
-// first boot has to DHCP, apk update + apk add e2fsprogs, mkfs the disk,
-// and (for profile-setup tests) run the profile's setup script — keep
-// this generous enough that a slow mirror doesn't flake the test but
-// tight enough that a genuine hang fails fast.
-const bootTimeout = 5 * time.Minute
+// bootTimeout bounds a single boot attempt. A successful boot (including
+// first-boot DHCP + apk + mkfs + setup) completes in under 15s. A hung
+// VM produces zero console output, so there's no point waiting longer
+// than 30s — it's either working or completely dead.
+const bootTimeout = 30 * time.Second
+
+// maxBootRetries is the number of times to retry a boot that times out.
+// Apple's Virtualization.framework occasionally fails to connect the
+// serial console on VM start (~20% of boots), producing zero kernel
+// output. This is a VZ bug — the VM is created and started without
+// error but the console pipe is dead. Retrying is the only mitigation.
+const maxBootRetries = 3
 
 // runPenShell spawns `pen shell NAME --dir WORKSPACE [extra...]`, feeds
 // it the provided shell script on stdin followed by `exit`, waits for
 // clean completion, and returns the combined stdout+stderr.
 //
-// Any error (non-zero exit, timeout, i/o error) is fatal: the boot log
-// is always logged via t.Logf so the caller can see what happened.
+// If a boot times out, it retries up to maxBootRetries times to work
+// around a VZ framework bug where the serial console intermittently
+// fails to connect. Non-timeout errors are always fatal.
 func runPenShell(t *testing.T, pen, name, workspace, script string, extra ...string) string {
 	t.Helper()
 
 	if !strings.HasSuffix(script, "\n") {
 		script += "\n"
 	}
-	// The guest init runs `/bin/sh -l` as a child and then `poweroff -f`
-	// when the shell exits, so we just need to exit the shell to get a
-	// clean shutdown. Sending EOF (closing stdin) would also work but
-	// an explicit `exit` is clearer in the logged script.
 	script += "exit\n"
 
-	ctx, cancel := context.WithTimeout(context.Background(), bootTimeout)
-	defer cancel()
-
 	args := append([]string{"shell", name, "--dir", workspace}, extra...)
-	cmd := exec.CommandContext(ctx, pen, args...)
-	cmd.Stdin = strings.NewReader(script)
-	out, err := cmd.CombinedOutput()
 
-	// Always log the boot output so -v runs can diagnose failures
-	// without having to re-run.
-	t.Logf("--- pen shell %s args=%v stdin ---\n%s--- pen shell %s output (%d bytes) ---\n%s--- end output ---",
-		name, args, script, name, len(out), out)
+	for attempt := 1; attempt <= maxBootRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), bootTimeout)
 
-	if ctx.Err() == context.DeadlineExceeded {
-		t.Fatalf("pen shell %s: timed out after %s", name, bootTimeout)
+		cmd := exec.CommandContext(ctx, pen, args...)
+		cmd.Stdin = strings.NewReader(script)
+		out, err := cmd.CombinedOutput()
+		cancel()
+
+		t.Logf("--- pen shell %s attempt %d/%d args=%v stdin ---\n%s--- pen shell %s output (%d bytes) ---\n%s--- end output ---",
+			name, attempt, maxBootRetries, args, script, name, len(out), out)
+
+		if ctx.Err() != context.DeadlineExceeded {
+			if err != nil {
+				t.Fatalf("pen shell %s: exec failed: %v", name, err)
+			}
+			return string(out)
+		}
+
+		// Timed out. If we have retries left, clean up stale dotfiles
+		// left by the killed process and try again. The killed pen
+		// process's defer never ran, so .pen-env/.pen-setup may linger
+		// in the workspace. We must remove them here because pen uses
+		// O_EXCL to prevent concurrent boots on the same workspace —
+		// a deliberate safety feature we don't want to bypass in prod.
+		if attempt < maxBootRetries {
+			t.Logf("pen shell %s: boot attempt %d timed out (VZ console flake), retrying", name, attempt)
+			os.Remove(filepath.Join(workspace, ".pen-env"))
+			os.Remove(filepath.Join(workspace, ".pen-setup"))
+			continue
+		}
+		t.Fatalf("pen shell %s: all %d boot attempts timed out after %s each", name, maxBootRetries, bootTimeout)
 	}
-	if err != nil {
-		t.Fatalf("pen shell %s: exec failed: %v", name, err)
-	}
-	return string(out)
+	panic("unreachable")
 }
 
 // penBinary resolves the path to the pen binary built by `make build`.
