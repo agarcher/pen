@@ -41,6 +41,15 @@ func AttachConsole(vmReader io.Reader, vmWriter io.Writer) error {
 	// for the brief lifetime of the process.
 	go func() {
 		_, _ = io.Copy(vmWriter, os.Stdin)
+		// When stdin is a finite source (pipe, not a terminal),
+		// io.Copy returns at EOF. Close the write end of the console
+		// pipe so the guest shell sees EOF and exits rather than
+		// blocking on read forever. Without this, piped usage like
+		// `echo "cmd" | pen shell foo` hangs if VZ drops any early
+		// stdin bytes before the guest console driver is initialized.
+		if closer, ok := vmWriter.(io.Closer); ok && !term.IsTerminal(fd) {
+			closer.Close()
+		}
 	}()
 
 	select {
