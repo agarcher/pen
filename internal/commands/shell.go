@@ -184,6 +184,16 @@ func runShell(cmd *cobra.Command, args []string) error {
 
 	hyp := virt.NewAppleHypervisor()
 
+	// Build the profile's custom image if needed. EnsureFresh is a no-op
+	// when the cached image is already up to date.
+	if prof != nil && prof.NeedsImageBuild() {
+		profilePaths, err := image.EnsureFresh(hyp, prof.Name, prof.Packages, prof.Build, imgs, cmd.ErrOrStderr())
+		if err != nil {
+			return fmt.Errorf("building profile image: %w", err)
+		}
+		imgs = profilePaths
+	}
+
 	fmt.Fprintf(cmd.ErrOrStderr(), "pen: booting %s (cpus=%d mem=%dMB dir=%s)\n", name, shellCPUs, shellMem, dir)
 
 	v, err := hyp.CreateVM(virt.VMConfig{

@@ -169,6 +169,56 @@ if [ -z "${PEN_INIT_STAGE2:-}" ]; then
         >/dev/null 2>&1 || pen_die "udhcpc failed — no IPv4 lease"
     pen_trace "network up"
 
+    # Build mode: install packages, run build script, repack rootfs into
+    # a new initrd, then halt. The builder VM has no overlay disk and no
+    # workspace share — just control (read-only) and output (read-write)
+    # virtio-fs shares.
+    if grep -q 'pen.mode=build' /proc/cmdline; then
+        pen_trace "build mode detected"
+
+        mkdir -p /control /output
+        mount -t virtiofs control /control || pen_die "mount /control failed"
+        mount -t virtiofs output /output   || pen_die "mount /output failed"
+
+        if [ -f /control/packages ] && [ -s /control/packages ]; then
+            pen_trace "installing packages"
+            apk update 2>&1
+            # Read packages into a variable — busybox xargs can't find
+            # apk on the bare initramfs PATH, so we call apk directly.
+            pkgs=$(tr '\n' ' ' < /control/packages)
+            apk add $pkgs 2>&1 || pen_die "apk add failed"
+        fi
+
+        if [ -f /control/build.sh ] && [ -s /control/build.sh ]; then
+            pen_trace "running build script"
+            /bin/sh /control/build.sh 2>&1
+            [ $? -eq 0 ] || pen_die "build script failed"
+        fi
+
+        rm -rf /var/cache/apk/*
+
+        pen_trace "repacking rootfs"
+        # Repack the rootfs into a cpio+gzip initrd. -xdev stays on
+        # the rootfs device; the prune/print logic is:
+        #  - control/output: fully excluded (builder shares, not in the image)
+        #  - proc/sys/dev/run/tmp: include the directory entry (mount point)
+        #    but prune contents (live kernel data we don't want baked in)
+        cd / && {
+            find . -xdev \
+                \( -path ./control -o -path ./output \) -prune -o \
+                \( -path ./proc -o -path ./sys -o -path ./dev \
+                   -o -path ./run -o -path ./tmp \) \
+                    \( -type d -print -prune \) -o \
+                -print
+        } | cpio -o -H newc 2>/dev/null | gzip > /output/initrd
+        [ -s /output/initrd ] || pen_die "initrd repack produced empty file"
+
+        pen_trace "build complete"
+        sync
+        poweroff -f
+        while :; do sleep 3600; done
+    fi
+
     [ -b /dev/vda ] || pen_die "/dev/vda missing — is the overlay disk attached?"
 
     # Format the overlay disk on first boot. e2fsprogs isn't in the base
