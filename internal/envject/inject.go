@@ -17,6 +17,12 @@ import (
 // EnvFileName is the name of the env file written to the shared directory.
 const EnvFileName = ".pen-env"
 
+// SetupFileName is the name of the first-boot setup script written to the
+// shared directory. The guest init copies it to tmpfs and deletes the
+// original on first boot, then runs it exactly once per fresh overlay
+// disk — gated by the /var/lib/pen/setup-done marker.
+const SetupFileName = ".pen-setup"
+
 // envNameRE matches valid POSIX shell variable names.
 var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -104,4 +110,41 @@ func WriteEnvFile(shareDir string, spec *EnvSpec) error {
 // CleanupEnvFile removes the env dotfile from the shared directory.
 func CleanupEnvFile(shareDir string) {
 	os.Remove(filepath.Join(shareDir, EnvFileName))
+}
+
+// WriteSetupFile writes the profile's first-boot setup script to a
+// dotfile in the shared directory. Empty or whitespace-only scripts are
+// a no-op (no file created), matching the guest's "absent = nothing to
+// run" behavior.
+//
+// The file is opened with the same O_EXCL|O_NOFOLLOW guard as
+// WriteEnvFile: a precreated .pen-setup symlink in an untrusted
+// workspace cannot redirect this write to a sensitive host file. If the
+// file already exists, we refuse rather than overwrite.
+func WriteSetupFile(shareDir, script string) error {
+	if strings.TrimSpace(script) == "" {
+		return nil
+	}
+
+	path := filepath.Join(shareDir, SetupFileName)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return fmt.Errorf("creating setup file: %w", err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("writing setup file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("closing setup file: %w", err)
+	}
+	return nil
+}
+
+// CleanupSetupFile removes the setup dotfile from the shared directory.
+// Idempotent: missing file is not an error.
+func CleanupSetupFile(shareDir string) {
+	os.Remove(filepath.Join(shareDir, SetupFileName))
 }

@@ -3,6 +3,7 @@ module github.com/agarcher/pen
 go 1.25.5
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/term v0.42.0

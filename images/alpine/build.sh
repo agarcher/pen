@@ -228,12 +228,53 @@ if [ -f /workspace/.pen-env ]; then
     rm -f /workspace/.pen-env
 fi
 
+# Same dance for the first-boot setup script. The host writes .pen-setup
+# alongside .pen-env when `pen shell --profile <name>` is used with a
+# profile that defines a non-empty `setup = """..."""`.
+if [ -f /workspace/.pen-setup ]; then
+    cp /workspace/.pen-setup /run/pen-setup
+    rm -f /workspace/.pen-setup
+fi
+
 # Set up environment
 export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TERM=xterm-256color
 [ -f /run/pen-env ] && . /run/pen-env
 cd /workspace 2>/dev/null || cd /root
+
+# First-boot setup hook. The marker at /var/lib/pen/setup-done lands on
+# the overlay's upper layer via normal copy-up, so it persists across
+# reboots but is absent on a fresh overlay. Running the hook here means
+# the script sees /run/pen-env already sourced and CWD at /workspace.
+#
+# Failure is fatal: a non-zero exit means we do NOT touch the marker
+# AND we do NOT launch a shell, so the user must fix the profile and
+# retry rather than inheriting a half-configured VM. We need live output
+# (user watches progress on the console) AND the real exit status of
+# the script — busybox sh has no pipefail, so we capture the status via
+# a tempfile inside a subshell before the pipe swallows it.
+if [ -f /run/pen-setup ] && [ ! -f /var/lib/pen/setup-done ]; then
+    pen_trace "running first-boot setup"
+    mkdir -p /var/lib/pen
+    rm -f /run/pen-setup-status
+    (
+        /bin/sh /run/pen-setup 2>&1
+        echo $? > /run/pen-setup-status
+    ) | sed 's/^/pen-setup: /' | tee /var/lib/pen/setup.log
+    setup_status=$(cat /run/pen-setup-status 2>/dev/null || echo 1)
+    rm -f /run/pen-setup /run/pen-setup-status
+    if [ "$setup_status" = "0" ]; then
+        touch /var/lib/pen/setup-done
+        pen_trace "first-boot setup complete"
+    else
+        echo "" >&2
+        echo "pen-setup: FAILED (exit $setup_status)" >&2
+        echo "pen-setup: full log at /var/lib/pen/setup.log (persisted on overlay)" >&2
+        echo "pen-setup: marker not written; next boot will retry" >&2
+        pen_die "first-boot setup failed"
+    fi
+fi
 
 echo ""
 echo "  pen vm ready"
