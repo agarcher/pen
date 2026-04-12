@@ -12,6 +12,7 @@ import (
 
 	"github.com/agarcher/pen/internal/envject"
 	"github.com/agarcher/pen/internal/image"
+	"github.com/agarcher/pen/internal/profile"
 	"github.com/agarcher/pen/internal/virt"
 	"github.com/agarcher/pen/internal/vm"
 	"github.com/spf13/cobra"
@@ -24,6 +25,7 @@ var (
 	shellEnv      []string // KEY=VALUE pairs
 	shellEnvHost  []string // key names to pass from host env
 	shellDiskSize string
+	shellProfile  string
 )
 
 func init() {
@@ -33,6 +35,7 @@ func init() {
 	shellCmd.Flags().StringArrayVar(&shellEnv, "env", nil, "Set env var in guest (KEY=VALUE)")
 	shellCmd.Flags().StringArrayVar(&shellEnvHost, "env-from-host", nil, "Pass env var from host to guest (KEY)")
 	shellCmd.Flags().StringVar(&shellDiskSize, "disk-size", "10G", "Overlay disk size (first boot only; ignored thereafter)")
+	shellCmd.Flags().StringVar(&shellProfile, "profile", "", "Named profile from ~/.config/pen/profiles/<name>.toml")
 	rootCmd.AddCommand(shellCmd)
 }
 
@@ -84,13 +87,52 @@ func runShell(cmd *cobra.Command, args []string) error {
 		spec.Explicit[k] = v
 	}
 
-	// Persist VM state.
+	// Resolve the effective profile before persisting state. Mismatch
+	// rules are strict: we refuse to attach a profile to a profile-less
+	// VM or switch between profiles, because the overlay has already
+	// been shaped by whatever setup ran (or didn't) the first time.
+	// Delete and recreate is the escape hatch.
+	var prof *profile.Profile
+	var prior *vm.VMState
+	effectiveProfile := shellProfile
+	if vm.Exists(name) {
+		var err error
+		prior, err = vm.Load(name)
+		if err != nil {
+			return fmt.Errorf("loading existing VM state: %w", err)
+		}
+		switch {
+		case prior.Profile == "" && shellProfile == "":
+			// no profile either way — nothing to do.
+		case prior.Profile == "" && shellProfile != "":
+			return fmt.Errorf("VM %q was created without a profile; cannot attach profile %q (delete and recreate if needed)", name, shellProfile)
+		case prior.Profile != "" && shellProfile == "":
+			fmt.Fprintf(cmd.ErrOrStderr(), "pen: using profile %q (from vm.json)\n", prior.Profile)
+			effectiveProfile = prior.Profile
+		case prior.Profile != "" && shellProfile != "" && prior.Profile != shellProfile:
+			return fmt.Errorf("VM %q was created with profile %q; cannot switch to %q (delete and recreate if needed)", name, prior.Profile, shellProfile)
+		}
+	}
+	if effectiveProfile != "" {
+		p, err := profile.Load(effectiveProfile)
+		if err != nil {
+			return fmt.Errorf("loading profile: %w", err)
+		}
+		prof = p
+	}
+
+	// Persist VM state. Preserve CreatedAt for existing VMs.
+	createdAt := time.Now()
+	if prior != nil {
+		createdAt = prior.CreatedAt
+	}
 	state := &vm.VMState{
 		Name:      name,
 		Dir:       dir,
 		CPUs:      shellCPUs,
 		MemoryMB:  shellMem,
-		CreatedAt: time.Now(),
+		Profile:   effectiveProfile,
+		CreatedAt: createdAt,
 	}
 	if err := vm.Save(state); err != nil {
 		return fmt.Errorf("saving VM state: %w", err)
@@ -111,6 +153,19 @@ func runShell(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("writing env file: %w", err)
 		}
 		defer envject.CleanupEnvFile(dir)
+	}
+
+	// Write the profile's first-boot setup script alongside .pen-env.
+	// The guest init copies it to tmpfs, deletes the original, and runs
+	// it exactly once per fresh VM (gated by /var/lib/pen/setup-done on
+	// the overlay). The defer is belt-and-braces: the guest removes the
+	// original on boot, but a crash before stage 2 would otherwise leave
+	// .pen-setup lingering in the workspace.
+	if prof != nil && strings.TrimSpace(prof.Setup) != "" {
+		if err := envject.WriteSetupFile(dir, prof.Setup); err != nil {
+			return fmt.Errorf("writing setup file: %w", err)
+		}
+		defer envject.CleanupSetupFile(dir)
 	}
 
 	// Ensure the per-VM overlay disk exists. Sized only on first creation;
