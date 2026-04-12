@@ -210,18 +210,19 @@ func TestNeedsImageBuild(t *testing.T) {
 		name     string
 		packages []string
 		build    string
+		setup    string
 		want     bool
 	}{
-		{"empty", nil, "", false},
-		{"setup-only", nil, "", false},
-		{"packages-only", []string{"nodejs"}, "", true},
-		{"build-only", nil, "echo hello", true},
-		{"both", []string{"nodejs"}, "echo hello", true},
-		{"whitespace-build", nil, "  \n  ", false},
+		{"empty", nil, "", "", false},
+		{"setup-only", nil, "", "echo hello", false},
+		{"packages-only", []string{"nodejs"}, "", "", true},
+		{"build-only", nil, "echo hello", "", true},
+		{"both", []string{"nodejs"}, "echo hello", "", true},
+		{"whitespace-build", nil, "  \n  ", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &Profile{Packages: tc.packages, Build: tc.build}
+			p := &Profile{Packages: tc.packages, Build: tc.build, Setup: tc.setup}
 			if got := p.NeedsImageBuild(); got != tc.want {
 				t.Errorf("NeedsImageBuild() = %v, want %v", got, tc.want)
 			}

@@ -1,15 +1,19 @@
 package image
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/agarcher/pen/internal/virt"
 )
+
+const buildLockFile = "build.lock"
 
 // Build builds a custom image for the named profile. It boots a builder
 // VM using the base kernel+initrd, installs packages, runs the build
@@ -23,6 +27,23 @@ func Build(hyp virt.Hypervisor, profileName string, packages []string, buildScri
 	if err != nil {
 		return fmt.Errorf("computing image hash: %w", err)
 	}
+
+	// Acquire an exclusive per-profile build lock. This serializes the
+	// freshness check and the cache writes so two concurrent builds
+	// can't interleave. Uses non-blocking flock — a second build for
+	// the same profile fails immediately rather than waiting.
+	profileDir, err := ProfileImageDir(profileName)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(profileDir, 0755); err != nil {
+		return fmt.Errorf("creating profile image dir: %w", err)
+	}
+	unlock, err := lockBuild(profileDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	fresh, err := IsImageFresh(profileName, expectedHash)
 	if err != nil {
@@ -87,11 +108,13 @@ func Build(hyp virt.Hypervisor, profileName string, packages []string, buildScri
 		return fmt.Errorf("starting builder VM: %w", err)
 	}
 
-	// Stream console output to the caller.
+	// Stream console output to the caller. Console() returns
+	// (io.Reader, io.Writer) with no error — the pipes are created
+	// during CreateVM and are always valid at this point.
 	consoleReader, _ := v.Console()
 	done := make(chan struct{})
 	go func() {
-		io.Copy(w, consoleReader)
+		_, _ = io.Copy(w, consoleReader)
 		close(done)
 	}()
 
@@ -111,15 +134,7 @@ func Build(hyp virt.Hypervisor, profileName string, packages []string, buildScri
 		return fmt.Errorf("build failed: output initrd is empty (check build log above)")
 	}
 
-	// Move to the profile image cache.
-	profileDir, err := ProfileImageDir(profileName)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(profileDir, 0755); err != nil {
-		return fmt.Errorf("creating profile image dir: %w", err)
-	}
-
+	// Move to the profile image cache (dir already created for the lock).
 	destInitrd := filepath.Join(profileDir, initrdFile)
 	// Copy rather than rename — tmp and profile dir may be on different filesystems.
 	if err := copyFile(outputInitrd, destInitrd); err != nil {
@@ -150,6 +165,31 @@ func EnsureFresh(hyp virt.Hypervisor, profileName string, packages []string, bui
 	return &Paths{
 		Kernel: basePaths.Kernel,
 		Initrd: filepath.Join(profileDir, initrdFile),
+	}, nil
+}
+
+// lockBuild acquires a non-blocking exclusive flock on build.lock inside
+// the profile image directory. Returns an unlock function. If the lock
+// is already held (another build in progress), returns an error
+// immediately rather than waiting.
+func lockBuild(profileDir string) (func(), error) {
+	path := filepath.Join(profileDir, buildLockFile)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("opening build lock: %w", err)
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("profile image is already being built by another process")
+		}
+		return nil, fmt.Errorf("acquiring build lock: %w", err)
+	}
+
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
 	}, nil
 }
 

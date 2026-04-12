@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -15,6 +16,11 @@ const (
 	profilesSubdir = "profiles"
 	hashFile       = "build.hash"
 )
+
+// profileNameRE matches valid profile names: alphanumeric start, then
+// alphanumerics, underscores, or dashes. Mirrors profile.nameRE but
+// kept here to avoid a circular import.
+var profileNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 // ProfileImageHash computes the cache key for a profile's custom image.
 // It hashes the sorted package list, the build script, and the content
@@ -52,6 +58,9 @@ func ProfileImageHash(packages []string, build string, baseInitrdPath string) (s
 // ProfileImageDir returns the directory where a profile's custom image
 // is cached: ~/.config/pen/images/profiles/<name>/.
 func ProfileImageDir(profileName string) (string, error) {
+	if profileName == "" || !profileNameRE.MatchString(profileName) {
+		return "", fmt.Errorf("invalid profile name %q", profileName)
+	}
 	dir, err := Dir()
 	if err != nil {
 		return "", err
@@ -68,14 +77,21 @@ func IsImageFresh(profileName string, expectedHash string) (bool, error) {
 		return false, err
 	}
 
-	// Both initrd and hash file must exist.
+	// Both initrd and hash file must exist. Only treat missing files
+	// as a cache miss; surface permission and other I/O errors.
 	if _, err := os.Stat(filepath.Join(dir, initrdFile)); err != nil {
-		return false, nil
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat cached initrd: %w", err)
 	}
 
 	stored, err := os.ReadFile(filepath.Join(dir, hashFile))
 	if err != nil {
-		return false, nil
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading cached build hash: %w", err)
 	}
 
 	return strings.TrimSpace(string(stored)) == expectedHash, nil
